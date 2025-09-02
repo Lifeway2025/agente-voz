@@ -19,18 +19,22 @@ def index():
     return "🚀 Servidor activo. Tu agente de voz está corriendo."
 
 # ✅ Llamada entrante
+from twilio.rest import Client
+
 @app.route("/voice", methods=["POST"])
 def voice():
     resp = VoiceResponse()
     resp.say("¡Gracias por llamar! Tu agente de voz ya está funcionando correctamente.", language="es-ES")
-    return Response(str(resp), mimetype="application/xml")
-    # Enviar WhatsApp de prueba
+
+    # Enviar un WhatsApp al número verificado
     try:
-        twilio_client.messages.create(
-            from_="whatsapp:" + TWILIO_NUMBER,
-            to="whatsapp:+34624467104",   # <-- pon aquí tu número verificado en WhatsApp
-            body="📲 Hola, este es un mensaje automático de prueba desde tu agente de voz."
+        client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+        message = client.messages.create(
+            from_="whatsapp:+14155238886",  # Sandbox de Twilio WhatsApp
+            body="Hola 👋, tu llamada fue recibida correctamente. Este es un mensaje automático de tu agente de voz.",
+            to="whatsapp:+34624467104"
         )
+        print("WhatsApp enviado:", message.sid)
     except Exception as e:
         print("Error enviando WhatsApp:", e)
 
