@@ -22,8 +22,8 @@ def index():
 @app.route("/voice", methods=["POST"])
 def voice():
     resp = VoiceResponse()
-    resp.say("¡Hola! Gracias por llamar. Tu agente de voz ya está funcionando en español.", language="es-ES")
-
+    resp.say("¡Gracias por llamar! Tu agente de voz ya está funcionando correctamente.", language="es-ES")
+    return Response(str(resp), mimetype="application/xml")
     # Enviar WhatsApp de prueba
     try:
         twilio_client.messages.create(
