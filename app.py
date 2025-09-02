@@ -28,7 +28,7 @@ def voice():
     try:
         twilio_client.messages.create(
             from_="whatsapp:" + TWILIO_NUMBER,
-            to="whatsapp:+346XXXXXXXX",   # <-- pon aquí tu número verificado en WhatsApp
+            to="whatsapp:+34624467104",   # <-- pon aquí tu número verificado en WhatsApp
             body="📲 Hola, este es un mensaje automático de prueba desde tu agente de voz."
         )
     except Exception as e:
