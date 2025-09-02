@@ -1,18 +1,15 @@
-from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.request_validator import RequestValidator
 import os
 
-app = Flask(__name__)
-
-@app.route("/")
-def index():
-    return "🚀 Hola, el agente de voz está en marcha!"
-
-@app.route("/voice", methods=["POST"])
-def voice():
-    resp = VoiceResponse()
-    resp.say("¡Gracias por llamar! Tu agente de voz ya está funcionando.", language="es-ES")
-    return Response(str(resp), mimetype="application/xml")
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+def is_valid_twilio_request(req) -> bool:
+    # Necesita TWILIO_AUTH_TOKEN
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not token:
+        return True  # si no tienes token, no bloquear (solo en pruebas)
+    validator = RequestValidator(token)
+    # URL pública de tu endpoint:
+    url = request.url  # p.ej. https://agente-voz.onrender.com/voice
+    # Todos los params form-data que Twilio envía:
+    params = request.form.to_dict()
+    signature = request.headers.get('X-Twilio-Signature', '')
+    return validator.validate(url, params, signature)
