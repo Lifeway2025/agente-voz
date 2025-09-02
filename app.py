@@ -82,6 +82,85 @@ def test_wa():
     to = format_e164(request.args.get("to", ""))
     ok = send_whatsapp(to, "Mensaje de prueba: WhatsApp Cloud API OK ✅")
     return {"ok": ok, "to": to}, (200 if ok else 400)
+    import requests, os, re
+from flask import Flask, request, Response
+from twilio.twiml.voice_response import VoiceResponse
+
+app = Flask(__name__)
+
+WA_TOKEN     = os.getenv("WA_TOKEN")
+WA_PHONE_ID  = os.getenv("WA_PHONE_ID")
+WA_API_URL   = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
+WA_TPL_NAME  = os.getenv("WA_TEMPLATE_NAME", "hello_world")
+WA_TPL_LANG  = os.getenv("WA_TEMPLATE_LANG", "es")
+
+def e164(num:str)->str:
+    if not num: return ""
+    num = re.sub(r"[^\d+]", "", num)
+    if num.startswith("00"): num = "+"+num[2:]
+    return num
+
+def wa_send_text(to_e164:str, text:str)->(bool,int,str):
+    payload = {
+        "messaging_product":"whatsapp",
+        "to": to_e164.replace("+",""),
+        "type":"text",
+        "text":{"body": text}
+    }
+    h={"Authorization":f"Bearer {WA_TOKEN}","Content-Type":"application/json"}
+    r = requests.post(WA_API_URL, json=payload, headers=h, timeout=10)
+    try:
+        return (r.status_code in (200,201), r.status_code, r.text)
+    except:
+        return (False, 0, "")
+
+def wa_send_template(to_e164:str, name:str, lang:str, components=None)->(bool,int,str):
+    payload = {
+        "messaging_product":"whatsapp",
+        "to": to_e164.replace("+",""),
+        "type":"template",
+        "template":{
+            "name": name,
+            "language":{"code": lang},
+            "components": components or []
+        }
+    }
+    h={"Authorization":f"Bearer {WA_TOKEN}","Content-Type":"application/json"}
+    r = requests.post(WA_API_URL, json=payload, headers=h, timeout=10)
+    try:
+        return (r.status_code in (200,201), r.status_code, r.text)
+    except:
+        return (False, 0, "")
+
+@app.route("/voice", methods=["POST"])
+def voice():
+    caller = e164(request.form.get("From"))
+    resp = VoiceResponse()
+    resp.say("¡Gracias por llamar! Tu agente de voz ya está funcionando.",
+             voice="alice", language="es-ES")
+
+    if caller and WA_TOKEN and WA_PHONE_ID:
+        ok, code, body = wa_send_text(
+            caller,
+            "Gracias por tu llamada. Te contactaremos en breve."
+        )
+        if not ok:
+            # Error típico cuando no hay ventana 24h: 470/400 con details “Unsupported message type”
+            # Reintenta con PLANTILLA
+            comp = [{
+                "type":"body",
+                "parameters":[{"type":"text","text":"¡gracias por llamar!"}]
+            }]
+            ok2, code2, body2 = wa_send_template(caller, WA_TPL_NAME, WA_TPL_LANG, comp)
+            print(f"[WA template] ok={ok2} code={code2} body={body2}")
+        else:
+            print(f"[WA text] ok={ok} code={code} body={body}")
+
+    return Response(str(resp), mimetype="application/xml")
+
+@app.route("/")
+def root():
+    return "OK"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
