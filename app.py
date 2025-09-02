@@ -1,45 +1,61 @@
-from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse
-from twilio.rest import Client
 import os
-import requests
+from flask import Flask, Response, request
+from twilio.twiml.voice_response import VoiceResponse, Connect
 
 app = Flask(__name__)
 
-# --- Configuración Twilio ---
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
+WS_URL = os.getenv("PROVIDER_WS_URL", "").strip()  # wss://... de tu proveedor
+PREROLL_TTS = os.getenv("PREROLL_TTS", "").strip() # Mensaje inicial opcional
+TTS_LANG = os.getenv("TTS_LANG", "es-ES")          # Idioma <Say>
+TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Conchita")  # Voz compatible con Twilio <Say>
 
-# Cliente Twilio
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-@app.route("/")
-def index():
-    return "🚀 Servidor activo. Tu agente de voz está corriendo."
-
-# ✅ Llamada entrante
-from twilio.rest import Client
+@app.route("/", methods=["GET"])
+def root():
+    return "OK - Voice gateway running."
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    resp = VoiceResponse()
-    resp.say("¡Gracias por llamar! Tu agente de voz ya está funcionando correctamente.", language="es-ES")
+    # (Opcional) podrías validar firma de Twilio aquí si quieres
+    if not WS_URL:
+        # Si faltara la URL del proveedor, devolvemos un aviso hablado
+        r = VoiceResponse()
+        r.say("Configuración incompleta. Falta la dirección del proveedor.", language="es-ES")
+        return Response(str(r), mimetype="application/xml")
 
-    # Enviar un WhatsApp al número verificado
-    try:
-        client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-        message = client.messages.create(
-            from_="whatsapp:+14155238886",  # Sandbox de Twilio WhatsApp
-            body="Hola 👋, tu llamada fue recibida correctamente. Este es un mensaje automático de tu agente de voz.",
-            to="whatsapp:+34624467104"
-        )
-        print("WhatsApp enviado:", message.sid)
-    except Exception as e:
-        print("Error enviando WhatsApp:", e)
+    r = VoiceResponse()
 
-    return Response(str(resp), mimetype="application/xml")
+    # Mensaje de cortinilla opcional antes de conectar
+    if PREROLL_TTS:
+        r.say(PREROLL_TTS, language=TTS_LANG, voice=TTS_VOICE)
 
+    connect = Connect()
+    # Conecta ambos canales de audio
+    stream = connect.stream(url=WS_URL, track="both_tracks")
+
+    # Puedes enviar metadatos al proveedor (los leerá como parámetros iniciales)
+    # Añade sólo los que tengas en entorno:
+    for env_key in [
+        "TWILIO_ACCOUNT_SID",
+        "WA_PHONE_ID",
+        "MONDAY_API",        # si quieres pasar tu token de Monday, etc.
+        "MAIL_FROM",
+        "MAIL_SMTP",
+        "WHATSAPP_TEMPLATE",
+    ]:
+        val = os.getenv(env_key)
+        if val:
+            stream.parameter(name=env_key.lower(), value=val)
+
+    r.append(connect)
+    return Response(str(r), mimetype="application/xml")
+
+# (Opcional) webhook de estados de llamada si lo configuras en Twilio
+@app.route("/status", methods=["POST"])
+def status():
+    # Solo registro sencillo para depurar
+    print("Call status:", dict(request.form))
+    return ("", 204)
 
 if __name__ == "__main__":
-   app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # Para desarrollo local; en Render se ejecuta con gunicorn
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
