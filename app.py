@@ -152,3 +152,9 @@ def gather_handler():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+    @app.route("/envcheck", methods=["GET"])
+def envcheck():
+    import os
+    val = os.getenv("OPENAI_API_KEY", "")
+    masked = (val[:7] + "…" + val[-4:]) if val else "(vacía)"
+    return f"OPENAI_API_KEY presente: {bool(val)} | {masked}", 200
