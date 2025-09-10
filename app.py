@@ -1,150 +1,93 @@
-# app.py
 import os
-import uuid
-import requests
-from io import BytesIO
-from flask import Flask, request, Response, send_file
-from twilio.twiml.voice_response import VoiceResponse
-
-# ====== Config ======
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY") or os.getenv("eleven_labs_api", "")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://agente-voz.onrender.com")
+from flask import Flask, request, send_file, Response
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from openai import OpenAI
+from elevenlabs import set_api_key, generate, save
 
 app = Flask(__name__)
-AUDIO_CACHE = {}  # id -> mp3 bytes
 
-# ====== Utilidades ======
-def think_with_openai(user_text: str) -> str:
-    if not OPENAI_API_KEY:
-        return "Falta la clave de OpenAI en el servidor."
-    if not user_text:
-        return "No te he oído bien, ¿puedes repetirlo?"
+# === Configura claves desde Render ===
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
-    system_prompt = (
-        "Eres el asistente inmobiliario de Vekke/Lifeway. "
-        "Respondes SIEMPRE en español, breve, claro y profesional. "
-        "Si falta información, pídela de forma natural. No inventes datos."
+# Comprueba las claves
+if not OPENAI_API_KEY or not ELEVENLABS_API_KEY:
+    raise EnvironmentError("Faltan OPENAI_API_KEY o ELEVENLABS_API_KEY en las variables de entorno.")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+set_api_key(ELEVENLABS_API_KEY)
+
+# === Función para obtener respuesta de OpenAI ===
+def obtener_respuesta_openai(pregunta):
+    respuesta = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Eres un asistente virtual amable y profesional. Responde breve y claro."},
+            {"role": "user", "content": pregunta}
+        ]
     )
+    return respuesta.choices[0].message.content.strip()
 
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-5",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                "max_tokens": 300,
-            },
-            timeout=30,
-        )
-        j = r.json()
-        reply = (
-            j.get("choices", [{}])[0]
-             .get("message", {})
-             .get("content", "")
-        ).strip()
-        return reply or "De acuerdo."
-    except Exception:
-        return "He tenido un problema al procesar tu petición. ¿Puedes repetirla?"
-
-def tts_elevenlabs(text: str) -> bytes:
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError("Falta ELEVENLABS_API_KEY en el servidor.")
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-    r = requests.post(
-        url,
-        headers={
-            "xi-api-key": ELEVENLABS_API_KEY,
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-        },
-        json={
-            "text": text,
-            "model_id": "eleven_turbo_v2",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
-            "optimize_streaming_latency": 2,
-        },
-        timeout=60,
+# === Función para generar audio con ElevenLabs ===
+def sintetizar_respuesta(texto):
+    audio = generate(
+        text=texto,
+        voice="Bella",  # Cambia por la voz que prefieras en ElevenLabs
+        model="eleven_multilingual_v2"
     )
-    r.raise_for_status()
-    return r.content
+    filename = "/tmp/respuesta.mp3"
+    save(audio, filename)
+    return filename
 
-# ====== Endpoints ======
-@app.route("/", methods=["GET"])
-def home():
-    return "Servidor activo (voz).", 200
-
-@app.route("/health", methods=["GET"])
-def health():
-    return "ok", 200
-
-# --- NUEVO: ver si la variable llega al proceso
-@app.route("/envcheck", methods=["GET"])
-def envcheck():
-    val = os.getenv("OPENAI_API_KEY", "")
-    masked = (val[:7] + "…" + val[-4:]) if val else "(vacía)"
-    return f"OPENAI_API_KEY presente: {bool(val)} | {masked}", 200
-
-@app.route("/audio/<clip_id>", methods=["GET"])
-def audio_clip(clip_id):
-    data = AUDIO_CACHE.get(clip_id)
-    if not data:
-        return "not found", 404
-    return send_file(BytesIO(data), mimetype="audio/mpeg")
-
-@app.route("/voice", methods=["POST"])
+# === Ruta raíz: saluda y pide input ===
+@app.route("/voice", methods=['POST', 'GET'])
 def voice():
     vr = VoiceResponse()
-    gather = vr.gather(
-        input="speech",
-        language="es-ES",
-        speechTimeout="auto",
-        action="/gather",
-        method="POST",
-    )
-    gather.say(
-        "Hola, soy el asistente virtual. ¿En qué puedo ayudarte?",
-        voice="alice",
-        language="es-ES",
-    )
-    vr.redirect("/voice")
-    return Response(str(vr), mimetype="text/xml")
+    gather = Gather(input="speech", action="/gather", method="POST", speechTimeout="auto")
+    gather.say("Hola, soy tu asistente virtual. ¿En qué puedo ayudarte?", language="es-ES", voice="Polly.Miguel")
+    vr.append(gather)
+    vr.say("No escuché nada. Por favor, vuelve a intentarlo.", language="es-ES")
+    return Response(str(vr), mimetype='text/xml')
 
-@app.route("/gather", methods=["POST"])
-def gather_handler():
-    user_text = (request.form.get("SpeechResult") or "").strip()
-    reply = think_with_openai(user_text)
-
-    vr = VoiceResponse()
-    try:
-        mp3 = tts_elevenlabs(reply)
-        clip_id = uuid.uuid4().hex[:12]
-        AUDIO_CACHE[clip_id] = mp3
-        audio_url = f"{PUBLIC_BASE_URL}/audio/{clip_id}"
-
-        vr.play(audio_url)
-        gather = vr.gather(
-            input="speech",
-            language="es-ES",
-            speechTimeout="auto",
-            action="/gather",
-            method="POST",
-        )
-        gather.say("¿Algo más?", voice="alice", language="es-ES")
-        return Response(str(vr), mimetype="text/xml")
-    except Exception:
-        vr.say(reply, voice="alice", language="es-ES")
+# === Ruta gather: procesa lo que dice el usuario ===
+@app.route("/gather", methods=['POST'])
+def gather():
+    user_input = request.values.get("SpeechResult", "").strip()
+    if not user_input:
+        vr = VoiceResponse()
+        vr.say("No entendí nada. Por favor, vuelve a intentarlo.", language="es-ES")
         vr.redirect("/voice")
-        return Response(str(vr), mimetype="text/xml")
+        return Response(str(vr), mimetype='text/xml')
 
+    # Obtiene respuesta de OpenAI
+    respuesta = obtener_respuesta_openai(user_input)
+
+    # Genera audio con ElevenLabs
+    audio_path = sintetizar_respuesta(respuesta)
+
+    # Responde a Twilio reproduciendo el audio generado
+    vr = VoiceResponse()
+    vr.play(url=request.host_url + f"audio?file={os.path.basename(audio_path)}")
+    return Response(str(vr), mimetype='text/xml')
+
+# === Sirve el audio generado ===
+@app.route("/audio", methods=['GET'])
+def audio():
+    file = request.args.get("file", "respuesta.mp3")
+    filepath = os.path.join("/tmp", file)
+    if os.path.exists(filepath):
+        return send_file(filepath, mimetype="audio/mpeg")
+    else:
+        return "Archivo no encontrado", 404
+
+# === Ruta para comprobar variables de entorno ===
+@app.route("/envcheck")
+def envcheck():
+    openai_ok = bool(OPENAI_API_KEY)
+    eleven_ok = bool(ELEVENLABS_API_KEY)
+    return f"OPENAI_API_KEY presente: {openai_ok}<br>ELEVENLABS_API_KEY presente: {eleven_ok}"
+
+# === Inicio local ===
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
