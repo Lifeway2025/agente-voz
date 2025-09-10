@@ -10,15 +10,13 @@ from twilio.twiml.voice_response import VoiceResponse
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY") or os.getenv("eleven_labs_api", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://agente-voz.onrender.com")  # Cambia si tu URL es otra
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://agente-voz.onrender.com")
 
-# ====== App & store ======
 app = Flask(__name__)
-AUDIO_CACHE = {}  # id -> mp3 bytes (en memoria del proceso)
+AUDIO_CACHE = {}  # id -> mp3 bytes
 
 # ====== Utilidades ======
 def think_with_openai(user_text: str) -> str:
-    """Razona con OpenAI y devuelve una respuesta breve, clara y profesional."""
     if not OPENAI_API_KEY:
         return "Falta la clave de OpenAI en el servidor."
     if not user_text:
@@ -52,16 +50,14 @@ def think_with_openai(user_text: str) -> str:
             j.get("choices", [{}])[0]
              .get("message", {})
              .get("content", "")
-            ).strip()
+        ).strip()
         return reply or "De acuerdo."
-    except Exception as e:
+    except Exception:
         return "He tenido un problema al procesar tu petición. ¿Puedes repetirla?"
 
 def tts_elevenlabs(text: str) -> bytes:
-    """Convierte texto a voz (MP3) con ElevenLabs y devuelve los bytes."""
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Falta ELEVENLABS_API_KEY en el servidor.")
-
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
     r = requests.post(
         url,
@@ -90,6 +86,13 @@ def home():
 def health():
     return "ok", 200
 
+# --- NUEVO: ver si la variable llega al proceso
+@app.route("/envcheck", methods=["GET"])
+def envcheck():
+    val = os.getenv("OPENAI_API_KEY", "")
+    masked = (val[:7] + "…" + val[-4:]) if val else "(vacía)"
+    return f"OPENAI_API_KEY presente: {bool(val)} | {masked}", 200
+
 @app.route("/audio/<clip_id>", methods=["GET"])
 def audio_clip(clip_id):
     data = AUDIO_CACHE.get(clip_id)
@@ -112,7 +115,6 @@ def voice():
         voice="alice",
         language="es-ES",
     )
-    # Si no habla, repetimos
     vr.redirect("/voice")
     return Response(str(vr), mimetype="text/xml")
 
@@ -123,13 +125,11 @@ def gather_handler():
 
     vr = VoiceResponse()
     try:
-        # Generar audio con ElevenLabs
         mp3 = tts_elevenlabs(reply)
         clip_id = uuid.uuid4().hex[:12]
         AUDIO_CACHE[clip_id] = mp3
         audio_url = f"{PUBLIC_BASE_URL}/audio/{clip_id}"
 
-        # Reproducir el MP3 con <Play> y volver a escuchar
         vr.play(audio_url)
         gather = vr.gather(
             input="speech",
@@ -138,23 +138,13 @@ def gather_handler():
             action="/gather",
             method="POST",
         )
-        # Fallback si por alguna razón no se reproduce el MP3
         gather.say("¿Algo más?", voice="alice", language="es-ES")
         return Response(str(vr), mimetype="text/xml")
-
     except Exception:
-        # Si falla ElevenLabs, usamos TTS de Twilio como respaldo
         vr.say(reply, voice="alice", language="es-ES")
         vr.redirect("/voice")
         return Response(str(vr), mimetype="text/xml")
 
-# ====== Run local (Render usa gunicorn vía Procfile) ======
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-    @app.route("/envcheck", methods=["GET"])
-def envcheck():
-    import os
-    val = os.getenv("OPENAI_API_KEY", "")
-    masked = (val[:7] + "…" + val[-4:]) if val else "(vacía)"
-    return f"OPENAI_API_KEY presente: {bool(val)} | {masked}", 200
