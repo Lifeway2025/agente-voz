@@ -32,6 +32,21 @@ MONDAY_BOARD_VISITS_ID = os.getenv("MONDAY_BOARD_VISITS_ID", "").strip()
 MONDAY_BOARD_LEADS_ID = os.getenv("MONDAY_BOARD_LEADS_ID", "").strip()
 
 MONDAY_API_URL = "https://api.monday.com/v2"
+# ==== Títulos de columnas en tus boards de Monday (AJUSTA ESTOS NOMBRES) ====
+# Board de PROPIEDADES
+COL_ZONA_TITLE   = "Zona"
+COL_PRECIO_TITLE = "Precio"
+COL_ESTADO_TITLE = "Estado"
+
+# Board de VISITAS (si usas uno separado)
+COL_VISITA_PROP_ID_TITLE = "Propiedad ID"
+COL_VISITA_FECHA_TITLE   = "Fecha"
+COL_VISITA_AGENTE_TITLE  = "Agente"
+COL_VISITA_ESTADO_TITLE  = "Estado"
+
+# Board de LEADS
+COL_LEAD_TELEFONO_TITLE = "Teléfono"
+COL_LEAD_NOTAS_TITLE    = "Notas"
 
 
 # =========================
@@ -87,6 +102,133 @@ def clip_messages(history: List[Dict[str, str]], max_turns: int) -> List[Dict[st
         log("Monday GraphQL errors:", j["errors"])
         raise RuntimeError("Monday GraphQL errors")
     return j.get("data", {})
+    def monday_search_props(zona: str | None, min_price: int | None, max_price: int | None, limit: int = 5):
+    """
+    Devuelve propiedades filtradas por zona y rango de precio (búsqueda simple con paginado básico).
+    Ajusta los títulos de columna arriba (COL_*_TITLE).
+    """
+    if not MONDAY_BOARD_PROPERTIES_ID:
+        return []
+
+    q = """
+    query($board_id: [Int]) {
+      boards (ids: $board_id) {
+        items_page (limit: 200) {
+          items {
+            id
+            name
+            column_values { title text }
+          }
+        }
+      }
+    }
+    """
+    data = monday_graphql(q, {"board_id": int(MONDAY_BOARD_PROPERTIES_ID)})
+
+    items = data.get("boards", [{}])[0].get("items_page", {}).get("items", [])
+    out = []
+    for it in items:
+        # Mapea: { "Zona": "Centro", "Precio": "300000", "Estado": "Disponible", ... }
+        cols = {cv["title"]: (cv.get("text") or "") for cv in it.get("column_values", [])}
+
+        zona_text   = cols.get(COL_ZONA_TITLE, "")
+        precio_text = cols.get(COL_PRECIO_TITLE, "")
+
+        # Normaliza precio a int
+        precio = None
+        try:
+            precio = int(precio_text.replace(".", "").replace(",", "").strip() or "0")
+        except Exception:
+            pass
+
+        ok = True
+        if zona and zona.lower() not in zona_text.lower():
+            ok = False
+        if min_price is not None and (precio is None or precio < min_price):
+            ok = False
+        if max_price is not None and (precio is None or precio > max_price):
+            ok = False
+
+        if ok:
+            out.append({
+                "id": it["id"],
+                "titulo": it["name"],
+                "zona": zona_text or None,
+                "precio": precio,
+                "estado": cols.get(COL_ESTADO_TITLE) or None,
+            })
+            if len(out) >= limit:
+                break
+
+    return out
+
+
+def monday_get_visits(property_id: str):
+    """
+    Obtiene visitas asociadas a una propiedad (si usas board de visitas).
+    Filtra por una columna 'Propiedad ID' que contenga el id de la propiedad.
+    Ajusta títulos de columnas arriba.
+    """
+    if not MONDAY_BOARD_VISITS_ID:
+        return []
+
+    q = """
+    query($board_id: [Int]) {
+      boards(ids: $board_id) {
+        items_page(limit: 200) {
+          items {
+            id
+            name
+            column_values { title text }
+          }
+        }
+      }
+    }
+    """
+    data = monday_graphql(q, {"board_id": int(MONDAY_BOARD_VISITS_ID)})
+    items = data.get("boards", [{}])[0].get("items_page", {}).get("items", [])
+
+    visits = []
+    for it in items:
+        cols = {cv["title"]: (cv.get("text") or "") for cv in it.get("column_values", [])}
+        if cols.get(COL_VISITA_PROP_ID_TITLE, "").strip() == str(property_id).strip():
+            visits.append({
+                "id": it["id"],
+                "fecha": cols.get(COL_VISITA_FECHA_TITLE) or None,
+                "agente": cols.get(COL_VISITA_AGENTE_TITLE) or None,
+                "estado": cols.get(COL_VISITA_ESTADO_TITLE) or None,
+            })
+    return visits
+
+
+def monday_create_lead(nombre: str, telefono: str, nota: str = "") -> str:
+    """
+    Crea un lead en Monday (ajusta board y columnas).
+    Devuelve el id del item creado.
+    """
+    if not MONDAY_BOARD_LEADS_ID:
+        raise RuntimeError("Falta MONDAY_BOARD_LEADS_ID")
+
+    mutation = """
+    mutation($board: Int!, $item: String!, $colvals: JSON!) {
+      create_item (board_id: $board, item_name: $item, column_values: $colvals) {
+        id
+      }
+    }
+    """
+
+    # Construye el dict usando los TÍTULOS de columna (no los IDs)
+    colvals = {
+        COL_LEAD_TELEFONO_TITLE: telefono,
+        COL_LEAD_NOTAS_TITLE: nota
+    }
+
+    data = monday_graphql(mutation, {
+        "board": int(MONDAY_BOARD_LEADS_ID),
+        "item": nombre,
+        "colvals": json.dumps(colvals),
+    })
+    return data.get("create_item", {}).get("id")
 
 
 # =========================
