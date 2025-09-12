@@ -280,6 +280,50 @@ def think_with_openai(user_text: str, history: List[Dict[str, str]]) -> str:
         log("OpenAI exception:", repr(e), traceback.format_exc())
         return ("Tu solicitud me llegó, pero tuve un problema al pensar la respuesta. "
                 "¿Puedes repetirlo con otras palabras?")
+        def plan_intent_with_openai(user_text: str) -> dict:
+    """
+    Devuelve SOLO un JSON con la intención y parámetros:
+    {
+      "intent": "search_properties" | "get_visits" | "create_lead" | "chitchat",
+      "zona": "...",
+      "presupuesto_min": 0,
+      "presupuesto_max": 0,
+      "property_id": "...",
+      "nombre": "...",
+      "telefono": "...",
+      "nota": "..."
+    }
+    """
+    sys = ("Eres un planificador. Lee el mensaje del usuario y devuelve SOLO un JSON válido "
+           "con la intención y parámetros necesarios. No expliques nada.")
+    prompt = (
+        "Intents válidos:\n"
+        "1) search_properties (zona?, presupuesto_min?, presupuesto_max?)\n"
+        "2) get_visits (property_id)\n"
+        "3) create_lead (nombre?, telefono?, nota?)\n"
+        "4) chitchat (sin campos)\n\n"
+        f"Usuario: {user_text}\n"
+        "Devuelve SOLO el JSON:"
+    )
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": OPENAI_MODEL, "messages": [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": prompt},
+    ], "temperature": 0}
+
+    try:
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=20)
+        j = r.json()
+        content = (j.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    except Exception as e:
+        log("planner exception:", repr(e))
+    return {"intent": "chitchat"}
 
 
 # =========================
@@ -330,89 +374,108 @@ def play_tts_to(container, text: str) -> None:
 # =========================
 # Rutas auxiliares
 # =========================
-@app.route("/", methods=["GET"])
-def home():
-    return "Servidor de voz activo.", 200
-
-@app.route("/health", methods=["GET"])
-def health():
-    return {"ok": True}, 200
-
-@app.route("/envcheck", methods=["GET"])
-def envcheck():
-    oa = OPENAI_API_KEY
-    el = ELEVENLABS_API_KEY
-    oa_mask = (oa[:7] + "…" + oa[-4:]) if oa else "(vacía)"
-    el_mask = (el[:7] + "…" + el[-4:]) if el else "(vacía)"
-    return (
-        f"OPENAI_API_KEY: {bool(oa)} | {oa_mask}\n"
-        f"ELEVENLABS_API_KEY: {bool(el)} | {el_mask}\n"
-        f"MODEL: {OPENAI_MODEL}\n"
-        f"VOICE_ID: {ELEVENLABS_VOICE_ID}"
-    ), 200
-
-@app.route("/audio/<clip_id>", methods=["GET"])
-def audio_clip(clip_id):
-    data = AUDIO_CACHE.get(clip_id)
-    if not data:
-        return "not found", 404
-    resp = send_file(BytesIO(data), mimetype="audio/mpeg")
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-# =========================
-# Flujo de llamada (Twilio)
-# =========================
-@app.route("/voice", methods=["POST", "GET"])
-def voice():
-    """Saludo + primer gather (todo con ElevenLabs)."""
-    call_sid = request.values.get("CallSid", "unknown")
-    if call_sid not in SESSIONS:
-        SESSIONS[call_sid] = [{"role": "system", "content": build_system_prompt()}]
-
-    vr = VoiceResponse()
-
-    # Importante: el saludo va DENTRO del gather
-    gather = vr.gather(
-        input="speech",
-        language="es-ES",
-        speechTimeout="auto",
-        action="/gather",
-        actionOnEmptyResult="true",
-        method="POST",
-    )
-    play_tts_to(gather, "Hola, gracias por llamar a Lifeway, ¿en qué puedo ayudarte?")
-
-    # Por si no hay entrada, reintenta
-    vr.pause(length=2)
-    vr.redirect("/voice")
-
-    return Response(str(vr), mimetype="text/xml")
-
-
 @app.route("/gather", methods=["POST"])
 def gather_handler():
-    """Recibe lo que dijo el usuario, razona con OpenAI y responde con ElevenLabs."""
     call_sid = request.values.get("CallSid", "unknown")
     user_text = (request.values.get("SpeechResult") or "").strip()
     log(f"gather: CallSid={call_sid}, user='{user_text}'")
 
-    # Historial
+    # Historial de la llamada (memoria)
     history = SESSIONS.get(call_sid, [{"role": "system", "content": build_system_prompt()}])
 
-    # Pensar con OpenAI
-    reply_text = think_with_openai(user_text or "No he entendido nada.", history)
+    # ---- NUEVO: planner para decidir acción ----
+    plan = plan_intent_with_openai(user_text or "")
+    log("plan:", plan)
+    intent = (plan.get("intent") or "chitchat").lower()
 
-    # Actualiza memoria
+    def to_int(x):
+        try:
+            return int(str(x).replace(".", "").replace(",", ""))
+        except Exception:
+            return None
+
+    reply_text = ""
+    try:
+        if intent == "search_properties":
+            zona = plan.get("zona")
+            pmin = to_int(plan.get("presupuesto_min"))
+            pmax = to_int(plan.get("presupuesto_max"))
+
+            props = monday_search_props(zona, pmin, pmax, limit=5)
+            if props:
+                lines = []
+                for p in props:
+                    precio = p.get("precio")
+                    precio_txt = f"{precio:,}".replace(",", ".") if isinstance(precio, int) else "s/d"
+                    zona_txt = p.get("zona") or "—"
+                    lines.append(f"{p['titulo']} ({zona_txt}) ~ {precio_txt}€ [ID {p['id']}]")
+                reply_text = (
+                    f"He encontrado {len(props)} opciones: " + "; ".join(lines) +
+                    ". ¿Quieres detalles de alguna o agendamos visita?"
+                )
+            else:
+                faltan = []
+                if not zona: faltan.append("zona")
+                if pmin is None and pmax is None: faltan.append("presupuesto")
+                if faltan:
+                    reply_text = f"Necesito {', '.join(faltan)} para afinar. ¿Qué zona y presupuesto manejas?"
+                else:
+                    reply_text = "No encuentro propiedades con esos criterios. ¿Probamos otra zona o presupuesto?"
+
+        elif intent == "get_visits":
+            pid = str(plan.get("property_id") or "").strip()
+            if not pid:
+                reply_text = "¿Qué ID de propiedad quieres consultar para visitas?"
+            else:
+                visits = monday_get_visits(pid)
+                if visits:
+                    resumen = "; ".join([
+                        f"{v.get('fecha') or 'sin fecha'} con {v.get('agente') or '—'}"
+                        for v in visits
+                    ])
+                    reply_text = (
+                        f"Veo {len(visits)} visitas para la propiedad {pid}: {resumen}. "
+                        "¿Quieres reservar una?"
+                    )
+                else:
+                    reply_text = (
+                        f"No veo visitas planificadas todavía para la propiedad {pid}. "
+                        "¿Quieres que te proponga fechas?"
+                    )
+
+        elif intent == "create_lead":
+            nombre = (plan.get("nombre") or "").strip() or "Lead sin nombre"
+            telefono = (plan.get("telefono") or "").strip()
+            nota = (plan.get("nota") or f"Desde llamada: {user_text[:120]}").strip()
+            if not MONDAY_BOARD_LEADS_ID:
+                reply_text = "Puedo registrarte como contacto. Dime tu nombre y teléfono, por favor."
+            else:
+                item_id = monday_create_lead(nombre, telefono, nota)
+                reply_text = (
+                    f"Perfecto, te he registrado como contacto (ID {item_id}). "
+                    "¿Quieres que te envíe opciones o agendamos visita?"
+                )
+
+        else:
+            # chitchat o fallback → usa razonamiento normal
+            reply_text = think_with_openai(user_text or "No he entendido nada.", history)
+
+    except Exception as e:
+        log("planner/monday error:", repr(e))
+        reply_text = (
+            "He tenido un problema consultando datos ahora mismo. "
+            "¿Puedes repetir la petición con la zona y el presupuesto?"
+        )
+
+    # ---- Actualiza memoria ----
     history.append({"role": "user", "content": user_text or "(vacío)"})
     history.append({"role": "assistant", "content": reply_text})
     SESSIONS[call_sid] = clip_messages(history, MAX_TURNS)
 
+    # ---- Responde con ElevenLabs y vuelve a escuchar ----
     vr = VoiceResponse()
-
-    # Respuesta principal (ElevenLabs)
     play_tts_to(vr, reply_text)
 
-    # Nuevo turno (gather) y repregunta (también con Eleven)
     gather = vr.gather(
         input="speech",
         language="es-ES",
@@ -423,16 +486,7 @@ def gather_handler():
     )
     play_tts_to(vr, "¿Algo más?")
 
-    # fallback por si no entra nada
     vr.pause(length=2)
     vr.redirect("/voice")
 
     return Response(str(vr), mimetype="text/xml")
-
-
-# =========================
-# Main (local)
-# =========================
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
