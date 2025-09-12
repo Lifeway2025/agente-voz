@@ -16,27 +16,22 @@ app = Flask(__name__)
 # Configuración / Entorno
 # =========================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL").strip()
 
-# Voz por defecto de ElevenLabs (puedes cambiarla por la tuya)
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
-
-# Modelo de OpenAI (estable y razonable)
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-# Número máximo de turnos de memoria por llamada
 MAX_TURNS = int(os.getenv("MAX_TURNS", "6"))
 
-# Almacenamiento en memoria (válido para pruebas / free tier)
-SESSIONS: Dict[str, List[Dict[str, str]]] = {}      # CallSid -> [ {role, content}, ... ]
-AUDIO_CACHE: Dict[str, bytes] = {}                   # audio_id -> mp3 data
+# Memoria simple en servidor (válido para pruebas)
+SESSIONS: Dict[str, List[Dict[str, str]]] = {}  # CallSid -> [{role, content}, ...]
+AUDIO_CACHE: Dict[str, bytes] = {}              # audio_id -> mp3 bytes
+
 
 # =========================
 # Utilidades
 # =========================
-
 def log(*args):
-    """Imprime en logs de Render con prefijo de tiempo."""
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}]", *args, flush=True)
 
@@ -50,29 +45,28 @@ def _safe_get(dct, *keys, default=None):
         return default
 
 def build_system_prompt() -> str:
-    """Prompt base para ‘razonamiento’ útil y tono profesional."""
+    """Prompt base (rol del asistente)"""
     return (
         "Eres el asistente inmobiliario de Vekke/Lifeway. "
         "Respondes SIEMPRE en español, claro y profesional. "
-        "Razona de forma implícita y entrega la respuesta en 1–3 frases. "
-        "Si falta información, haz una pregunta útil para avanzar. "
+        "Razona de forma implícita, entrega la respuesta en 1–3 frases y, si falta información, "
+        "haz una pregunta útil para avanzar. "
         "Nunca digas simplemente ‘De acuerdo’. "
-        "Si el usuario quiere visitar una propiedad, pide rango de fechas/horarios. "
-        "Si pregunta por inventario, solicita zona/presupuesto y ofrece opciones."
+        "Si el usuario quiere visitar una propiedad, pide rango de fechas y horarios. "
+        "Si pregunta por inventario, solicita zona y presupuesto y ofrece opciones."
     )
 
 def clip_messages(history: List[Dict[str, str]], max_turns: int) -> List[Dict[str, str]]:
-    """Corta la historia para no pasar demasiados tokens a OpenAI."""
-    # Mantén el primer mensaje de sistema + últimos turnos
+    """Limita el contexto que enviamos a OpenAI."""
     system = [m for m in history if m["role"] == "system"][:1]
     rest = [m for m in history if m["role"] != "system"]
-    return system + rest[-max_turns*2:]  # 2 por turno (user+assistant)
+    return system + rest[-max_turns*2:]  # user+assistant por turno
+
 
 # =========================
-# OpenAI via requests (robusto)
+# OpenAI (Chat Completions)
 # =========================
 def think_with_openai(user_text: str, history: List[Dict[str, str]]) -> str:
-    """Llama a OpenAI Chat Completions con manejo de errores y fallback."""
     if not OPENAI_API_KEY:
         return "Falta la clave de OpenAI en el servidor."
 
@@ -101,18 +95,16 @@ def think_with_openai(user_text: str, history: List[Dict[str, str]]) -> str:
             timeout=30,
         )
         if r.status_code >= 400:
-            log("OpenAI HTTP error:", r.status_code, r.text)
-            return ("Estoy teniendo un problema técnico con el análisis. "
+            log("OpenAI HTTP error:", r.status_code, r.text[:800])
+            return ("Estoy teniendo un problema técnico al pensar la respuesta. "
                     "¿Puedes reformularlo brevemente o darme un poco más de contexto?")
         j = r.json()
         content = _safe_get(j, "choices", 0, "message", "content", default="").strip()
         if not content:
             log("OpenAI empty content:", json.dumps(j)[:1200])
-            content = ("Te he oído, pero necesito un detalle más para ayudarte mejor. "
+            content = ("Te he oído, pero necesito un detalle más para ayudarte. "
                        "¿Buscas información de alguna propiedad concreta o quieres agendar una visita?")
-        # Evita respuestas demasiado vacías
-        low = content.lower()
-        if low in {"ok", "vale", "de acuerdo", "entendido"}:
+        if content.lower() in {"ok", "vale", "de acuerdo", "entendido"}:
             content = ("De acuerdo. ¿Te interesa información de alguna propiedad concreta "
                        "o prefieres que te proponga opciones y fechas de visita?")
         return content
@@ -121,11 +113,12 @@ def think_with_openai(user_text: str, history: List[Dict[str, str]]) -> str:
         return ("Tu solicitud me llegó, pero tuve un problema al pensar la respuesta. "
                 "¿Puedes repetirlo con otras palabras?")
 
+
 # =========================
-# ElevenLabs TTS (HTTP)
+# ElevenLabs TTS
 # =========================
 def tts_elevenlabs(text: str) -> bytes:
-    """Convierte texto a audio MP3 con ElevenLabs. Lanza excepción si falla."""
+    """Convierte texto a MP3 usando ElevenLabs."""
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Falta ELEVENLABS_API_KEY en el servidor.")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
@@ -149,6 +142,22 @@ def tts_elevenlabs(text: str) -> bytes:
         log("ElevenLabs HTTP error:", r.status_code, r.text[:800])
         raise RuntimeError(f"ElevenLabs error {r.status_code}")
     return r.content
+
+def play_tts_to(container, text: str) -> None:
+    """
+    Genera audio con ElevenLabs y lo añade al 'container' (VoiceResponse o Gather).
+    Si ElevenLabs falla, usamos <Say> de Twilio como último recurso para no dejar la llamada muda.
+    """
+    try:
+        mp3 = tts_elevenlabs(text)
+        audio_id = uuid.uuid4().hex[:12]
+        AUDIO_CACHE[audio_id] = mp3
+        audio_url = (request.url_root.rstrip("/") + f"/audio/{audio_id}")
+        container.play(audio_url)
+    except Exception as e:
+        log("TTS fallback (Polly) en play_tts_to:", repr(e))
+        container.say(text, voice="alice", language="es-ES")
+
 
 # =========================
 # Rutas auxiliares
@@ -180,45 +189,51 @@ def audio_clip(clip_id):
     if not data:
         return "not found", 404
     resp = send_file(BytesIO(data), mimetype="audio/mpeg")
-    # Evitar caching del lado de Twilio/CDN si vas variando respuestas
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
 
 # =========================
 # Flujo de llamada (Twilio)
 # =========================
 @app.route("/voice", methods=["POST", "GET"])
 def voice():
-    """Primer saludo y gather de voz."""
+    """Saludo + primer gather (todo con ElevenLabs)."""
     call_sid = request.values.get("CallSid", "unknown")
-    # Inicia historia si no existe
     if call_sid not in SESSIONS:
         SESSIONS[call_sid] = [{"role": "system", "content": build_system_prompt()}]
 
     vr = VoiceResponse()
+
+    # Importante: el saludo va DENTRO del gather
     gather = vr.gather(
         input="speech",
         language="es-ES",
         speechTimeout="auto",
         action="/gather",
+        actionOnEmptyResult="true",
         method="POST",
     )
-    gather.say("Hola, soy tu asistente virtual. ¿En qué puedo ayudarte?", voice="alice", language="es-ES")
-    # Si no contesta, reintenta
+    play_tts_to(gather, "Hola, gracias por llamar a Lifeway, ¿en qué puedo ayudarte?")
+
+    # Por si no hay entrada, reintenta
+    vr.pause(length=2)
     vr.redirect("/voice")
+
     return Response(str(vr), mimetype="text/xml")
+
 
 @app.route("/gather", methods=["POST"])
 def gather_handler():
-    """Recibe lo dicho, llama a OpenAI y responde con voz (ElevenLabs o Polly)."""
+    """Recibe lo que dijo el usuario, razona con OpenAI y responde con ElevenLabs."""
     call_sid = request.values.get("CallSid", "unknown")
     user_text = (request.values.get("SpeechResult") or "").strip()
     log(f"gather: CallSid={call_sid}, user='{user_text}'")
 
-    # Obtiene conversación previa
+    # Historial
     history = SESSIONS.get(call_sid, [{"role": "system", "content": build_system_prompt()}])
 
-    # Razonamiento con OpenAI
+    # Pensar con OpenAI
     reply_text = think_with_openai(user_text or "No he entendido nada.", history)
 
     # Actualiza memoria
@@ -227,27 +242,25 @@ def gather_handler():
     SESSIONS[call_sid] = clip_messages(history, MAX_TURNS)
 
     vr = VoiceResponse()
-    try:
-        # Intenta ElevenLabs TTS
-        mp3 = tts_elevenlabs(reply_text)
-        audio_id = uuid.uuid4().hex[:12]
-        AUDIO_CACHE[audio_id] = mp3
-        audio_url = (request.url_root.rstrip("/") + f"/audio/{audio_id}")
-        vr.play(audio_url)
-    except Exception as e:
-        # Fallback a voz de Twilio (Polly)
-        log("TTS fallback (Polly):", repr(e))
-        vr.say(reply_text, voice="alice", language="es-ES")
 
-    # Vuelve a escuchar al usuario para continuar
+    # Respuesta principal (ElevenLabs)
+    play_tts_to(vr, reply_text)
+
+    # Nuevo turno (gather) y repregunta (también con Eleven)
     gather = vr.gather(
         input="speech",
         language="es-ES",
         speechTimeout="auto",
         action="/gather",
+        actionOnEmptyResult="true",
         method="POST",
     )
-    gather.say("¿Algo más?", voice="alice", language="es-ES")
+    play_tts_to(vr, "¿Algo más?")
+
+    # fallback por si no entra nada
+    vr.pause(length=2)
+    vr.redirect("/voice")
+
     return Response(str(vr), mimetype="text/xml")
 
 
