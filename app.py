@@ -359,29 +359,6 @@ def audio_clip(clip_id):
     resp = send_file(BytesIO(data), mimetype="audio/mpeg")
     resp.headers["Cache-Control"] = "no-store"
     return resp
-@app.route("/diag/monday/board", methods=["GET"])
-def diag_monday_board():
-    bid = request.args.get("board_id") or MONDAY_BOARD_PROPERTIES_ID
-    if not bid:
-        return "Falta board_id", 400
-    q = """
-    query($board_id: [Int]) {
-      boards(ids: $board_id) {
-        name
-        columns { id title type }
-        items_page(limit: 5) {
-          items {
-            id
-            name
-            column_values { id title text }
-          }
-        }
-      }
-    }
-    """
-    data = monday_graphql(q, {"board_id": int(bid)})
-    return data, 200
-
 # =========================
 # Flujo de llamada (Twilio)
 # =========================
