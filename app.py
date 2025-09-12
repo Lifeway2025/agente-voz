@@ -26,6 +26,12 @@ MAX_TURNS = int(os.getenv("MAX_TURNS", "6"))
 # Memoria simple en servidor (válido para pruebas)
 SESSIONS: Dict[str, List[Dict[str, str]]] = {}  # CallSid -> [{role, content}, ...]
 AUDIO_CACHE: Dict[str, bytes] = {}              # audio_id -> mp3 bytes
+MONDAY_API_KEY = os.getenv("MONDAY_API_KEY", "").strip()
+MONDAY_BOARD_PROPERTIES_ID = os.getenv("MONDAY_BOARD_PROPERTIES_ID", "").strip()
+MONDAY_BOARD_VISITS_ID = os.getenv("MONDAY_BOARD_VISITS_ID", "").strip()
+MONDAY_BOARD_LEADS_ID = os.getenv("MONDAY_BOARD_LEADS_ID", "").strip()
+
+MONDAY_API_URL = "https://api.monday.com/v2"
 
 
 # =========================
@@ -61,6 +67,26 @@ def clip_messages(history: List[Dict[str, str]], max_turns: int) -> List[Dict[st
     system = [m for m in history if m["role"] == "system"][:1]
     rest = [m for m in history if m["role"] != "system"]
     return system + rest[-max_turns*2:]  # user+assistant por turno
+    def monday_graphql(query: str, variables: dict | None = None) -> dict:
+    if not MONDAY_API_KEY:
+        raise RuntimeError("Falta MONDAY_API_KEY en el servidor.")
+    r = requests.post(
+        MONDAY_API_URL,
+        headers={
+            "Authorization": MONDAY_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={"query": query, "variables": variables or {}},
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        log("Monday HTTP error:", r.status_code, r.text[:800])
+        raise RuntimeError(f"Monday error {r.status_code}")
+    j = r.json()
+    if "errors" in j:
+        log("Monday GraphQL errors:", j["errors"])
+        raise RuntimeError("Monday GraphQL errors")
+    return j.get("data", {})
 
 
 # =========================
