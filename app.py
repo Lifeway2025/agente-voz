@@ -41,7 +41,7 @@ MONDAY_API_URL  = "https://api.monday.com/v2"
 MONDAY_BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "0") or "0")
 
 # Email por SMTP (OVH)
-MAIL_SMTP_HOST     = os.getenv("MAIL_SMTP_HOST", "")     # ej: ssl0.ovh.net
+MAIL_SMTP_HOST     = env_int("MAIL_SMTP_PORT", 587)     # ej: ssl0.ovh.net
 MAIL_SMTP_PORT     = int(os.getenv("MAIL_SMTP_PORT", "587"))
 MAIL_SMTP_USER     = os.getenv("MAIL_SMTP_USER", "")     # ej: usuario@dominio
 MAIL_SMTP_PASS     = os.getenv("MAIL_SMTP_PASS", "")
