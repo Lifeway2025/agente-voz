@@ -1,492 +1,300 @@
+# app.py
 import os
-import uuid
-import time
+import io
 import json
-import traceback
-from io import BytesIO
-from typing import Dict, List
+import time
+import uuid
+import logging
+from typing import Any, Dict, Optional
 
 import requests
-from flask import Flask, request, Response, send_file
-from twilio.twiml.voice_response import VoiceResponse
+from flask import Flask, request, Response, abort, send_file
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client as TwilioClient
+
+# === ENV VARS (configura en Render) ===
+OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL           = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+TWILIO_ACCOUNT_SID     = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN      = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_E164      = os.getenv("TWILIO_PHONE_E164", "+34930348966")
+MESSAGING_SERVICE_SID  = os.getenv("MESSAGING_SERVICE_SID", "")
+
+ELEVEN_API_KEY         = os.getenv("ELEVEN_API_KEY", "")
+ELEVEN_VOICE_ID        = os.getenv("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+
+MONDAY_API_KEY         = os.getenv("MONDAY_API_KEY", "")
+MONDAY_API_URL         = "https://api.monday.com/v2"
+
+# --- NUEVO: configuración de tu mail_api ---
+MAIL_API_URL           = os.getenv("MAIL_API_URL", "")  # p.ej. https://mail.miapi.com/send
+MAIL_API_TOKEN         = os.getenv("MAIL_API_TOKEN", "")  # si usas Bearer/Key
+MAIL_FROM_EMAIL        = os.getenv("MAIL_FROM_EMAIL", "no-reply@gcaconsulting.es")
+MAIL_FROM_NAME         = os.getenv("MAIL_FROM_NAME", "GCA Consulting")
+MAIL_API_MODE          = os.getenv("MAIL_API_MODE", "json")  # "json" o "form"
+MAIL_API_TO_FIELD      = os.getenv("MAIL_API_TO_FIELD", "to")
+MAIL_API_SUBJ_FIELD    = os.getenv("MAIL_API_SUBJ_FIELD", "subject")
+MAIL_API_HTML_FIELD    = os.getenv("MAIL_API_HTML_FIELD", "html")
+MAIL_API_FROM_FIELD    = os.getenv("MAIL_API_FROM_FIELD", "from")
+MAIL_API_NAME_FIELD    = os.getenv("MAIL_API_NAME_FIELD", "from_name")
+MAIL_API_EXTRA_HEADERS = os.getenv("MAIL_API_EXTRA_HEADERS", "")  # JSON: {"X-Tenant":"gca"}
+
+BRAND_NAME             = os.getenv("BRAND_NAME", "GCA Consulting")
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("gca")
 
-# =========================
-# Configuración / Entorno
-# =========================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+AUDIO_STORE: Dict[str, bytes] = {}
+_twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL").strip()
+# ---------- Utilidades ----------
+def ok_json(data: Any, code: int = 200):
+    return Response(json.dumps(data, ensure_ascii=False), status=code, mimetype="application/json")
 
-MAX_TURNS = int(os.getenv("MAX_TURNS", "6"))
-
-# Memoria simple en servidor (válido para pruebas)
-SESSIONS: Dict[str, List[Dict[str, str]]] = {}  # CallSid -> [{role, content}, ...]
-AUDIO_CACHE: Dict[str, bytes] = {}              # audio_id -> mp3 bytes
-MONDAY_API_KEY = os.getenv("MONDAY_API_KEY", "").strip()
-MONDAY_BOARD_PROPERTIES_ID = os.getenv("MONDAY_BOARD_PROPERTIES_ID", "").strip()
-MONDAY_BOARD_VISITS_ID = os.getenv("MONDAY_BOARD_VISITS_ID", "").strip()
-MONDAY_BOARD_LEADS_ID = os.getenv("MONDAY_BOARD_LEADS_ID", "").strip()
-
-MONDAY_API_URL = "https://api.monday.com/v2"
-# ==== Títulos de columnas en tus boards de Monday (AJUSTA ESTOS NOMBRES) ====
-# Board de PROPIEDADES
-COL_ZONA_TITLE   = "Zona"
-COL_PRECIO_TITLE = "Precio"
-COL_ESTADO_TITLE = "Estado"
-
-# Board de VISITAS (si usas uno separado)
-COL_VISITA_PROP_ID_TITLE = "Propiedad ID"
-COL_VISITA_FECHA_TITLE   = "Fecha"
-COL_VISITA_AGENTE_TITLE  = "Agente"
-COL_VISITA_ESTADO_TITLE  = "Estado"
-
-# Board de LEADS
-COL_LEAD_TELEFONO_TITLE = "Teléfono"
-COL_LEAD_NOTAS_TITLE    = "Notas"
-
-
-# =========================
-# Utilidades
-# =========================
-def log(*args):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}]", *args, flush=True)
-
-def _safe_get(dct, *keys, default=None):
-    cur = dct
-    try:
-        for k in keys:
-            cur = cur[k]
-        return cur
-    except Exception:
-        return default
-
-def build_system_prompt() -> str:
-    """Prompt base (rol del asistente)"""
-    return (
-        "Eres el asistente inmobiliario de Vekke/Lifeway. "
-        "Respondes SIEMPRE en español, claro y profesional. "
-        "Razona de forma implícita, entrega la respuesta en 1–3 frases y, si falta información, "
-        "haz una pregunta útil para avanzar. "
-        "Nunca digas simplemente ‘De acuerdo’. "
-        "Si el usuario quiere visitar una propiedad, pide rango de fechas y horarios. "
-        "Si pregunta por inventario, solicita zona y presupuesto y ofrece opciones."
-    )
-
-def clip_messages(history: List[Dict[str, str]], max_turns: int) -> List[Dict[str, str]]:
-    """Limita el contexto que enviamos a OpenAI."""
-    system = [m for m in history if m["role"] == "system"][:1]
-    rest = [m for m in history if m["role"] != "system"]
-    return system + rest[-max_turns*2:]  # user+assistant por turno
-    def monday_graphql(query: str, variables: dict | None = None) -> dict:
-    if not MONDAY_API_KEY:
-        raise RuntimeError("Falta MONDAY_API_KEY en el servidor.")
-    r = requests.post(
-        MONDAY_API_URL,
-        headers={
-            "Authorization": MONDAY_API_KEY,
-            "Content-Type": "application/json",
-        },
-        json={"query": query, "variables": variables or {}},
-        timeout=30,
-    )
-    if r.status_code >= 400:
-        log("Monday HTTP error:", r.status_code, r.text[:800])
-        raise RuntimeError(f"Monday error {r.status_code}")
-    j = r.json()
-    if "errors" in j:
-        log("Monday GraphQL errors:", j["errors"])
-        raise RuntimeError("Monday GraphQL errors")
-    return j.get("data", {})
-    def monday_search_props(zona: str | None, min_price: int | None, max_price: int | None, limit: int = 5):
-    """
-    Devuelve propiedades filtradas por zona y rango de precio (búsqueda simple con paginado básico).
-    Ajusta los títulos de columna arriba (COL_*_TITLE).
-    """
-    if not MONDAY_BOARD_PROPERTIES_ID:
-        return []
-
-    q = """
-    query($board_id: [Int]) {
-      boards (ids: $board_id) {
-        items_page (limit: 200) {
-          items {
-            id
-            name
-            column_values { title text }
-          }
-        }
-      }
-    }
-    """
-    data = monday_graphql(q, {"board_id": int(MONDAY_BOARD_PROPERTIES_ID)})
-
-    items = data.get("boards", [{}])[0].get("items_page", {}).get("items", [])
-    out = []
-    for it in items:
-        # Mapea: { "Zona": "Centro", "Precio": "300000", "Estado": "Disponible", ... }
-        cols = {cv["title"]: (cv.get("text") or "") for cv in it.get("column_values", [])}
-
-        zona_text   = cols.get(COL_ZONA_TITLE, "")
-        precio_text = cols.get(COL_PRECIO_TITLE, "")
-
-        # Normaliza precio a int
-        precio = None
-        try:
-            precio = int(precio_text.replace(".", "").replace(",", "").strip() or "0")
-        except Exception:
-            pass
-
-        ok = True
-        if zona and zona.lower() not in zona_text.lower():
-            ok = False
-        if min_price is not None and (precio is None or precio < min_price):
-            ok = False
-        if max_price is not None and (precio is None or precio > max_price):
-            ok = False
-
-        if ok:
-            out.append({
-                "id": it["id"],
-                "titulo": it["name"],
-                "zona": zona_text or None,
-                "precio": precio,
-                "estado": cols.get(COL_ESTADO_TITLE) or None,
-            })
-            if len(out) >= limit:
-                break
-
-    return out
-
-
-def monday_get_visits(property_id: str):
-    """
-    Obtiene visitas asociadas a una propiedad (si usas board de visitas).
-    Filtra por una columna 'Propiedad ID' que contenga el id de la propiedad.
-    Ajusta títulos de columnas arriba.
-    """
-    if not MONDAY_BOARD_VISITS_ID:
-        return []
-
-    q = """
-    query($board_id: [Int]) {
-      boards(ids: $board_id) {
-        items_page(limit: 200) {
-          items {
-            id
-            name
-            column_values { title text }
-          }
-        }
-      }
-    }
-    """
-    data = monday_graphql(q, {"board_id": int(MONDAY_BOARD_VISITS_ID)})
-    items = data.get("boards", [{}])[0].get("items_page", {}).get("items", [])
-
-    visits = []
-    for it in items:
-        cols = {cv["title"]: (cv.get("text") or "") for cv in it.get("column_values", [])}
-        if cols.get(COL_VISITA_PROP_ID_TITLE, "").strip() == str(property_id).strip():
-            visits.append({
-                "id": it["id"],
-                "fecha": cols.get(COL_VISITA_FECHA_TITLE) or None,
-                "agente": cols.get(COL_VISITA_AGENTE_TITLE) or None,
-                "estado": cols.get(COL_VISITA_ESTADO_TITLE) or None,
-            })
-    return visits
-
-
-def monday_create_lead(nombre: str, telefono: str, nota: str = "") -> str:
-    """
-    Crea un lead en Monday (ajusta board y columnas).
-    Devuelve el id del item creado.
-    """
-    if not MONDAY_BOARD_LEADS_ID:
-        raise RuntimeError("Falta MONDAY_BOARD_LEADS_ID")
-
-    mutation = """
-    mutation($board: Int!, $item: String!, $colvals: JSON!) {
-      create_item (board_id: $board, item_name: $item, column_values: $colvals) {
-        id
-      }
-    }
-    """
-
-    # Construye el dict usando los TÍTULOS de columna (no los IDs)
-    colvals = {
-        COL_LEAD_TELEFONO_TITLE: telefono,
-        COL_LEAD_NOTAS_TITLE: nota
-    }
-
-    data = monday_graphql(mutation, {
-        "board": int(MONDAY_BOARD_LEADS_ID),
-        "item": nombre,
-        "colvals": json.dumps(colvals),
-    })
-    return data.get("create_item", {}).get("id")
-
-
-# =========================
-# OpenAI (Chat Completions)
-# =========================
-def think_with_openai(user_text: str, history: List[Dict[str, str]]) -> str:
+def _openai_chat(messages, temperature=0.2, response_format: Optional[Dict]=None):
     if not OPENAI_API_KEY:
-        return "Falta la clave de OpenAI en el servidor."
-
-    messages = history.copy()
-    if not messages or messages[0]["role"] != "system":
-        messages.insert(0, {"role": "system", "content": build_system_prompt()})
-    messages.append({"role": "user", "content": user_text})
-    messages = clip_messages(messages, MAX_TURNS)
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": messages,
-        "temperature": 0.5,
-        "max_tokens": 300,
-    }
-
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            log("OpenAI HTTP error:", r.status_code, r.text[:800])
-            return ("Estoy teniendo un problema técnico al pensar la respuesta. "
-                    "¿Puedes reformularlo brevemente o darme un poco más de contexto?")
-        j = r.json()
-        content = _safe_get(j, "choices", 0, "message", "content", default="").strip()
-        if not content:
-            log("OpenAI empty content:", json.dumps(j)[:1200])
-            content = ("Te he oído, pero necesito un detalle más para ayudarte. "
-                       "¿Buscas información de alguna propiedad concreta o quieres agendar una visita?")
-        if content.lower() in {"ok", "vale", "de acuerdo", "entendido"}:
-            content = ("De acuerdo. ¿Te interesa información de alguna propiedad concreta "
-                       "o prefieres que te proponga opciones y fechas de visita?")
-        return content
-    except Exception as e:
-        log("OpenAI exception:", repr(e), traceback.format_exc())
-        return ("Tu solicitud me llegó, pero tuve un problema al pensar la respuesta. "
-                "¿Puedes repetirlo con otras palabras?")
-        def plan_intent_with_openai(user_text: str) -> dict:
-    """
-    Devuelve SOLO un JSON con la intención y parámetros:
-    {
-      "intent": "search_properties" | "get_visits" | "create_lead" | "chitchat",
-      "zona": "...",
-      "presupuesto_min": 0,
-      "presupuesto_max": 0,
-      "property_id": "...",
-      "nombre": "...",
-      "telefono": "...",
-      "nota": "..."
-    }
-    """
-    sys = ("Eres un planificador. Lee el mensaje del usuario y devuelve SOLO un JSON válido "
-           "con la intención y parámetros necesarios. No expliques nada.")
-    prompt = (
-        "Intents válidos:\n"
-        "1) search_properties (zona?, presupuesto_min?, presupuesto_max?)\n"
-        "2) get_visits (property_id)\n"
-        "3) create_lead (nombre?, telefono?, nota?)\n"
-        "4) chitchat (sin campos)\n\n"
-        f"Usuario: {user_text}\n"
-        "Devuelve SOLO el JSON:"
-    )
+        raise RuntimeError("OPENAI_API_KEY not configured")
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": OPENAI_MODEL, "messages": [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": prompt},
-    ], "temperature": 0}
+    payload = {"model": OPENAI_MODEL, "messages": messages, "temperature": temperature}
+    if response_format: payload["response_format"] = response_format
+    resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
-    try:
-        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=20)
-        j = r.json()
-        content = (j.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
-        try:
-            obj = json.loads(content)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-    except Exception as e:
-        log("planner exception:", repr(e))
-    return {"intent": "chitchat"}
-
-
-# =========================
-# ElevenLabs TTS
-# =========================
-def tts_elevenlabs(text: str) -> bytes:
-    """Convierte texto a MP3 usando ElevenLabs."""
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError("Falta ELEVENLABS_API_KEY en el servidor.")
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-    payload = {
-        "text": text,
-        "model_id": "eleven_turbo_v2",
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
-        "optimize_streaming_latency": 2,
-    }
-    r = requests.post(
-        url,
-        headers={
-            "xi-api-key": ELEVENLABS_API_KEY,
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
+def plan_intent(user_text: str) -> Dict[str, Any]:
+    sys = (
+        "Eres un planificador. Devuelve SOLO un JSON válido con:"
+        "{'intent':'chitchat|search_property|send_whatsapp|send_email|help',"
+        " 'property_id':str|null,'phone':str|null,'email':str|null,'message':str|null}"
     )
-    if r.status_code >= 400:
-        log("ElevenLabs HTTP error:", r.status_code, r.text[:800])
-        raise RuntimeError(f"ElevenLabs error {r.status_code}")
+    try:
+        out = _openai_chat([{"role":"system","content":sys},{"role":"user","content":user_text}], temperature=0.1)
+        return json.loads(out)
+    except Exception as e:
+        logger.exception("plan_intent error: %s", e)
+        return {"intent":"chitchat","message":user_text,"property_id":None,"phone":None,"email":None}
+
+def eleven_tts_to_bytes(text: str) -> bytes:
+    if not ELEVEN_API_KEY:
+        return b""
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
+    headers = {"xi-api-key": ELEVEN_API_KEY, "accept": "audio/mpeg", "content-type": "application/json"}
+    payload = {"text": text, "model_id": "eleven_multilingual_v2", "voice_settings": {"stability":0.5,"similarity_boost":0.75}}
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
     return r.content
 
-def play_tts_to(container, text: str) -> None:
-    """
-    Genera audio con ElevenLabs y lo añade al 'container' (VoiceResponse o Gather).
-    Si ElevenLabs falla, usamos <Say> de Twilio como último recurso para no dejar la llamada muda.
-    """
-    try:
-        mp3 = tts_elevenlabs(text)
-        audio_id = uuid.uuid4().hex[:12]
-        AUDIO_CACHE[audio_id] = mp3
-        audio_url = (request.url_root.rstrip("/") + f"/audio/{audio_id}")
-        container.play(audio_url)
-    except Exception as e:
-        log("TTS fallback (Polly) en play_tts_to:", repr(e))
-        container.say(text, voice="alice", language="es-ES")
+def monday_query(query: str, variables: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    if not MONDAY_API_KEY:
+        raise RuntimeError("MONDAY_API_KEY not configured")
+    headers = {"Authorization": MONDAY_API_KEY, "Content-Type": "application/json"}
+    body = {"query": query, "variables": variables or {}}
+    r = requests.post(MONDAY_API_URL, headers=headers, json=body, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    if "errors" in data: raise RuntimeError(f"Monday error: {data['errors']}")
+    return data["data"]
 
+def monday_get_property_by_id(board_id: int, item_id: int) -> Dict[str, Any]:
+    q = """
+    query($board:Int!, $item:Int!) {
+      items (ids: [$item]) { id name column_values { id text value } board { id name } }
+    }"""
+    data = monday_query(q, {"board": board_id, "item": item_id})
+    items = data.get("items") or []
+    return items[0] if items else {}
 
-# =========================
-# Rutas auxiliares
-# =========================
-@app.route("/gather", methods=["POST"])
-def gather_handler():
-    call_sid = request.values.get("CallSid", "unknown")
-    user_text = (request.values.get("SpeechResult") or "").strip()
-    log(f"gather: CallSid={call_sid}, user='{user_text}'")
+def send_whatsapp(to_e164: str, body: Optional[str]=None, content_sid: Optional[str]=None, content_vars: Optional[Dict[str,Any]]=None) -> str:
+    params = {"to": f"whatsapp:{to_e164}", "from_": f"whatsapp:{TWILIO_PHONE_E164}"}
+    if MESSAGING_SERVICE_SID: params["messaging_service_sid"] = MESSAGING_SERVICE_SID
+    if content_sid:
+        params["content_sid"] = content_sid
+        if content_vars: params["content_variables"] = json.dumps(content_vars, ensure_ascii=False)
+    else:
+        params["body"] = body or ""
+    msg = _twilio.messages.create(**params)
+    return msg.sid
 
-    # Historial de la llamada (memoria)
-    history = SESSIONS.get(call_sid, [{"role": "system", "content": build_system_prompt()}])
+# --- NUEVO: envío de email vía tu mail_api ---
+def send_email(to_email: str, subject: str, html: str) -> Dict[str, Any]:
+    if not MAIL_API_URL:
+        raise RuntimeError("MAIL_API_URL not configured")
 
-    # ---- NUEVO: planner para decidir acción ----
-    plan = plan_intent_with_openai(user_text or "")
-    log("plan:", plan)
-    intent = (plan.get("intent") or "chitchat").lower()
+    payload = {
+        MAIL_API_TO_FIELD: to_email,
+        MAIL_API_SUBJ_FIELD: subject,
+        MAIL_API_HTML_FIELD: html,
+        MAIL_API_FROM_FIELD: MAIL_FROM_EMAIL,
+        MAIL_API_NAME_FIELD: MAIL_FROM_NAME,
+    }
 
-    def to_int(x):
+    headers = {}
+    # Autenticación típica: Authorization: Bearer <token> (ajústalo si tu API pide otra cosa)
+    if MAIL_API_TOKEN:
+        headers["Authorization"] = f"Bearer {MAIL_API_TOKEN}"
+    # Headers extra opcionales (en JSON en la env var)
+    if MAIL_API_EXTRA_HEADERS:
         try:
-            return int(str(x).replace(".", "").replace(",", ""))
+            headers.update(json.loads(MAIL_API_EXTRA_HEADERS))
         except Exception:
-            return None
+            pass
 
-    reply_text = ""
+    # Soporta modo JSON o application/x-www-form-urlencoded
+    if MAIL_API_MODE.lower() == "form":
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        resp = requests.post(MAIL_API_URL, headers=headers, data=payload, timeout=30)
+    else:
+        headers["Content-Type"] = "application/json"
+        resp = requests.post(MAIL_API_URL, headers=headers, json=payload, timeout=30)
+
     try:
-        if intent == "search_properties":
-            zona = plan.get("zona")
-            pmin = to_int(plan.get("presupuesto_min"))
-            pmax = to_int(plan.get("presupuesto_max"))
+        resp.raise_for_status()
+        return {"ok": True, "status": resp.status_code, "body": resp.text[:300]}
+    except requests.HTTPError:
+        return {"ok": False, "status": resp.status_code, "body": resp.text[:1000]}
 
-            props = monday_search_props(zona, pmin, pmax, limit=5)
-            if props:
-                lines = []
-                for p in props:
-                    precio = p.get("precio")
-                    precio_txt = f"{precio:,}".replace(",", ".") if isinstance(precio, int) else "s/d"
-                    zona_txt = p.get("zona") or "—"
-                    lines.append(f"{p['titulo']} ({zona_txt}) ~ {precio_txt}€ [ID {p['id']}]")
-                reply_text = (
-                    f"He encontrado {len(props)} opciones: " + "; ".join(lines) +
-                    ". ¿Quieres detalles de alguna o agendamos visita?"
-                )
-            else:
-                faltan = []
-                if not zona: faltan.append("zona")
-                if pmin is None and pmax is None: faltan.append("presupuesto")
-                if faltan:
-                    reply_text = f"Necesito {', '.join(faltan)} para afinar. ¿Qué zona y presupuesto manejas?"
-                else:
-                    reply_text = "No encuentro propiedades con esos criterios. ¿Probamos otra zona o presupuesto?"
+def build_property_summary(item: Dict[str, Any]) -> str:
+    if not item: return "No he encontrado esa propiedad."
+    kv = {cv["id"]: cv.get("text") for cv in (item.get("column_values") or [])}
+    nombre = item.get("name") or "Propiedad"
+    precio = kv.get("price") or kv.get("precio") or "—"
+    direccion = kv.get("direccion") or kv.get("address") or "—"
+    metros = kv.get("metros") or kv.get("sqm") or "—"
+    return f"{nombre}\nDirección: {direccion}\nPrecio: {precio}\nSuperficie: {metros} m²"
 
-        elif intent == "get_visits":
-            pid = str(plan.get("property_id") or "").strip()
-            if not pid:
-                reply_text = "¿Qué ID de propiedad quieres consultar para visitas?"
-            else:
-                visits = monday_get_visits(pid)
-                if visits:
-                    resumen = "; ".join([
-                        f"{v.get('fecha') or 'sin fecha'} con {v.get('agente') or '—'}"
-                        for v in visits
-                    ])
-                    reply_text = (
-                        f"Veo {len(visits)} visitas para la propiedad {pid}: {resumen}. "
-                        "¿Quieres reservar una?"
-                    )
-                else:
-                    reply_text = (
-                        f"No veo visitas planificadas todavía para la propiedad {pid}. "
-                        "¿Quieres que te proponga fechas?"
-                    )
+# ---------- Rutas ----------
+@app.get("/healthz")
+def health():
+    return ok_json({"ok": True, "ts": int(time.time())})
 
-        elif intent == "create_lead":
-            nombre = (plan.get("nombre") or "").strip() or "Lead sin nombre"
-            telefono = (plan.get("telefono") or "").strip()
-            nota = (plan.get("nota") or f"Desde llamada: {user_text[:120]}").strip()
-            if not MONDAY_BOARD_LEADS_ID:
-                reply_text = "Puedo registrarte como contacto. Dime tu nombre y teléfono, por favor."
+@app.get("/audio/<audio_id>.mp3")
+def serve_audio(audio_id: str):
+    data = AUDIO_STORE.get(audio_id)
+    if not data: abort(404)
+    return send_file(io.BytesIO(data), mimetype="audio/mpeg", download_name=f"{audio_id}.mp3")
+
+@app.post("/whatsapp")
+def whatsapp_inbound():
+    from_ = request.values.get("From", "")
+    body  = (request.values.get("Body") or "").strip()
+    logger.info("WHATSAPP INBOUND from=%s body=%s", from_, body)
+
+    plan = plan_intent(body)
+    reply = MessagingResponse()
+    try:
+        if plan.get("intent") == "search_property":
+            board_id = int(os.getenv("MONDAY_BOARD_ID", "0")) or 0
+            prop_id  = int(str(plan.get("property_id") or "0"))
+            item = monday_get_property_by_id(board_id, prop_id) if (board_id and prop_id) else {}
+            reply.message(build_property_summary(item))
+
+        elif plan.get("intent") == "send_whatsapp":
+            dest = plan.get("phone"); text = plan.get("message") or f"Hola, te escribe {BRAND_NAME}."
+            if dest:
+                sid = send_whatsapp(dest, body=text)
+                reply.message(f"Enviado WhatsApp a {dest} (SID {sid}).")
             else:
-                item_id = monday_create_lead(nombre, telefono, nota)
-                reply_text = (
-                    f"Perfecto, te he registrado como contacto (ID {item_id}). "
-                    "¿Quieres que te envíe opciones o agendamos visita?"
-                )
+                reply.message("Dime: 'enviar whatsapp a +34XXXXXXXXX: <mensaje>'")
+
+        elif plan.get("intent") == "send_email":
+            email = plan.get("email"); text = plan.get("message") or "Hola,"
+            if email:
+                r = send_email(email, f"[{BRAND_NAME}] Información solicitada", f"<p>{text}</p>")
+                reply.message(f"Email a {email} (ok={r.get('ok')}).")
+            else:
+                reply.message("Dime: 'email a correo@dominio.com: <mensaje>'")
 
         else:
-            # chitchat o fallback → usa razonamiento normal
-            reply_text = think_with_openai(user_text or "No he entendido nada.", history)
+            chat = _openai_chat(
+                [{"role":"system","content":f"Eres asistente de {BRAND_NAME}. Responde breve y útil."},
+                 {"role":"user","content": body}]
+            )
+            reply.message(chat)
+    except Exception:
+        logger.exception("error whatsapp_inbound")
+        reply.message("Error procesando la solicitud. Probemos de nuevo en un momento.")
+    return Response(str(reply), mimetype="application/xml")
 
-    except Exception as e:
-        log("planner/monday error:", repr(e))
-        reply_text = (
-            "He tenido un problema consultando datos ahora mismo. "
-            "¿Puedes repetir la petición con la zona y el presupuesto?"
-        )
-
-    # ---- Actualiza memoria ----
-    history.append({"role": "user", "content": user_text or "(vacío)"})
-    history.append({"role": "assistant", "content": reply_text})
-    SESSIONS[call_sid] = clip_messages(history, MAX_TURNS)
-
-    # ---- Responde con ElevenLabs y vuelve a escuchar ----
+@app.post("/voice")
+def voice_inbound():
     vr = VoiceResponse()
-    play_tts_to(vr, reply_text)
-
-    gather = vr.gather(
-        input="speech",
-        language="es-ES",
-        speechTimeout="auto",
-        action="/gather",
-        actionOnEmptyResult="true",
-        method="POST",
-    )
-    play_tts_to(vr, "¿Algo más?")
-
-    vr.pause(length=2)
+    text = f"Bienvenido a {BRAND_NAME}. Después del tono, cuéntame qué necesitas. También puedes pulsar uno para recibir por WhatsApp la ficha de una propiedad."
+    audio_bytes = eleven_tts_to_bytes(text)
+    if audio_bytes:
+        audio_id = str(uuid.uuid4()); AUDIO_STORE[audio_id] = audio_bytes
+        vr.play(f"{request.url_root.rstrip('/')}/audio/{audio_id}.mp3")
+    else:
+        vr.say(text, language="es-ES")
+    g = Gather(input="speech dtmf", timeout=6, num_digits=1, action="/gather", speech_timeout="auto", language="es-ES")
+    vr.append(g)
+    vr.pause(length=1)
     vr.redirect("/voice")
+    return Response(str(vr), mimetype="application/xml")
 
-    return Response(str(vr), mimetype="text/xml")
+@app.post("/gather")
+def gather_handler():
+    digit = request.values.get("Digits")
+    speech = (request.values.get("SpeechResult") or "").strip()
+    vr = VoiceResponse()
+    try:
+        if digit == "1":
+            msg = "Perfecto. Te enviaremos un WhatsApp con la ficha de la última propiedad destacada."
+            audio_bytes = eleven_tts_to_bytes(msg)
+            if audio_bytes:
+                audio_id = str(uuid.uuid4()); AUDIO_STORE[audio_id] = audio_bytes; vr.play(f"{request.url_root.rstrip('/')}/audio/{audio_id}.mp3")
+            else:
+                vr.say(msg, language="es-ES")
+            vr.hangup(); return Response(str(vr), mimetype="application/xml")
+
+        plan = plan_intent(speech or "")
+        answer_text = ""
+        if plan.get("intent") == "search_property":
+            board_id = int(os.getenv("MONDAY_BOARD_ID", "0")) or 0
+            prop_id  = int(str(plan.get("property_id") or "0"))
+            item = monday_get_property_by_id(board_id, prop_id) if (board_id and prop_id) else {}
+            answer_text = "He encontrado lo siguiente: " + build_property_summary(item).replace("\n", ". ")
+        elif plan.get("intent") == "send_whatsapp":
+            dest = plan.get("phone"); text = plan.get("message") or f"Hola, te escribe {BRAND_NAME}."
+            if dest: send_whatsapp(dest, body=text); answer_text = f"He enviado el WhatsApp a {dest}."
+            else:    answer_text = "No he detectado el número."
+        elif plan.get("intent") == "send_email":
+            email = plan.get("email"); text = plan.get("message") or "Hola,"
+            if email: send_email(email, f"[{BRAND_NAME}] Información solicitada", f"<p>{text}</p>"); answer_text = f"He enviado el correo a {email}."
+            else:     answer_text = "No he detectado el correo."
+        else:
+            chat = _openai_chat(
+                [{"role":"system","content":f"Eres asistente telefónico de {BRAND_NAME}. Sé conciso."},
+                 {"role":"user","content": speech}]
+            )
+            answer_text = chat or "De acuerdo, lo gestiono ahora mismo."
+
+        audio_bytes = eleven_tts_to_bytes(answer_text)
+        if audio_bytes:
+            audio_id = str(uuid.uuid4()); AUDIO_STORE[audio_id] = audio_bytes
+            vr.play(f"{request.url_root.rstrip('/')}/audio/{audio_id}.mp3")
+        else:
+            vr.say(answer_text, language="es-ES")
+    except Exception:
+        logger.exception("gather error")
+        vr.say("Ha ocurrido un error procesando tu petición.", language="es-ES")
+    vr.hangup()
+    return Response(str(vr), mimetype="application/xml")
+
+@app.post("/ops/send-whatsapp")
+def ops_send_whatsapp():
+    if request.headers.get("X-Auth") != os.getenv("OPS_TOKEN", ""): abort(403)
+    data = request.get_json(force=True)
+    sid = send_whatsapp(data["to"], body=data.get("body"), content_sid=data.get("content_sid"), content_vars=data.get("content_vars"))
+    return ok_json({"sid": sid})
+
+@app.post("/ops/send-email")
+def ops_send_email():
+    if request.headers.get("X-Auth") != os.getenv("OPS_TOKEN", ""): abort(403)
+    data = request.get_json(force=True)
+    r = send_email(data["to"], data["subject"], data["html"])
+    return ok_json(r)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
