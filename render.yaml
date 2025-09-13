@@ -1,0 +1,58 @@
+services:
+  - type: web
+    name: gca-twilio-webhooks
+    env: python
+    plan: free            # cámbialo a 'starter' o superior si quieres evitar “sleep”
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers=2 --threads=8 --timeout=90
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_E164
+        value: "+34930348966"
+      - key: MESSAGING_SERVICE_SID
+        sync: false
+      - key: ELEVEN_API_KEY
+        sync: false
+      - key: ELEVEN_VOICE_ID
+        value: "21m00Tcm4TlvDq8ikWAM"
+      - key: MONDAY_API_KEY
+        sync: false
+      - key: MONDAY_BOARD_ID
+        value: "0"          # pon el ID real del board
+      # --- Mail API (sustituye por tu endpoint/formato) ---
+      - key: MAIL_API_URL
+        sync: false
+      - key: MAIL_API_TOKEN
+        sync: false
+      - key: MAIL_FROM_EMAIL
+        value: "no-reply@gcaconsulting.es"
+      - key: MAIL_FROM_NAME
+        value: "GCA Consulting"
+      - key: MAIL_API_MODE
+        value: "json"       # o "form"
+      - key: MAIL_API_TO_FIELD
+        value: "to"
+      - key: MAIL_API_SUBJ_FIELD
+        value: "subject"
+      - key: MAIL_API_HTML_FIELD
+        value: "html"
+      - key: MAIL_API_FROM_FIELD
+        value: "from"
+      - key: MAIL_API_NAME_FIELD
+        value: "from_name"
+      - key: MAIL_API_EXTRA_HEADERS
+        value: ""           # JSON opcional, ej: {"X-Tenant":"gca"}
+      # --- Operaciones opcionales ---
+      - key: BRAND_NAME
+        value: "GCA Consulting"
+      - key: OPS_TOKEN
+        sync: false
