@@ -1,11 +1,11 @@
-# app.py — Lifeway Voice Agent (razonador + herramientas)
+# app.py — Lifeway Voice Agent (razonador + herramientas + vía rápida)
 # Twilio (voz) + ElevenLabs TTS + Monday (REOS) + WhatsApp + subelementos
 #
-# ENV necesarios:
+# ENV necesarios (Render):
 # OPENAI_API_KEY
 # OPENAI_MODEL (opcional, por defecto "gpt-4o-mini")
 # ELEVEN_API_KEY (o ELEVENLABS_API_KEY)
-# ELEVEN_VOICE_ID (o ELEVENLABS_VOICE_ID)   # voz de Eleven
+# ELEVEN_VOICE_ID (o ELEVENLABS_VOICE_ID)
 # TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_E164  (p.ej. "+34930348966")
 # MONDAY_API_KEY (o monday_api)
 # MONDAY_DEFAULT_BOARD_ID=2147303762   # REOS BOT LIFEWAY (padre)
@@ -16,8 +16,13 @@
 # SUB_REOS_EMAIL_COL_ID=email_mks7kagf
 # SUB_REOS_STATUS_COL_ID=color_mkvst8na
 # OPS_TOKEN  (para /ops/book-visit)
+#
+# (Opcionales para velocidad)
+# FAST_MODE=1              # Usa <Say> para respuestas cortas (instantáneo)
+# BOARD_CACHE_TTL=60       # Cache de items Monday (segundos)
+# AUDIO_CACHE_TTL=600      # Cache de audios Eleven (segundos)
 
-import os, io, json, time, uuid, logging, re
+import os, io, json, time, uuid, logging, re, hashlib
 from typing import Any, Dict, Optional, List
 from datetime import datetime
 
@@ -51,7 +56,7 @@ TWILIO_PHONE_E164  = _env_str("TWILIO_PHONE_E164") or _env_str("TWILIO_NUMBER")
 
 MONDAY_API_KEY   = _env_str("MONDAY_API_KEY") or _env_str("monday_api")
 MONDAY_API_URL   = "https://api.monday.com/v2"
-MONDAY_DEFAULT_BOARD_ID = _env_int("MONDAY_DEFAULT_BOARD_ID", 2147303762)  # REOS por defecto
+MONDAY_DEFAULT_BOARD_ID = _env_int("MONDAY_DEFAULT_BOARD_ID", 2147303762)  # REOS
 
 # Subitems REOS (board 2147303765) — IDs proporcionados
 SUB_REOS_NAME_COL_ID   = _env_str("SUB_REOS_NAME_COL_ID")   # name
@@ -64,6 +69,15 @@ SUB_REOS_STATUS_COL_ID = _env_str("SUB_REOS_STATUS_COL_ID") # color_mkvst8na
 BRAND_NAME = _env_str("BRAND_NAME", "Lifeway")
 OPS_TOKEN  = _env_str("OPS_TOKEN")
 
+# Velocidad / cachés
+FAST_MODE = _env_str("FAST_MODE", "0") == "1"
+BOARD_CACHE_TTL = _env_int("BOARD_CACHE_TTL", 60)
+AUDIO_CACHE_TTL = _env_int("AUDIO_CACHE_TTL", 600)
+
+# Cache de Monday (items por board) y cache de audio (texto -> mp3 bytes)
+_BOARD_CACHE: Dict[int, Dict[str, Any]] = {}    # {board_id: {"ts":..., "items":[...]}}
+_AUDIO_MEMO: Dict[str, Dict[str, Any]] = {}      # {hash(text): {"ts":..., "bytes":...}}
+
 # Columnas tablero padre (REOS y CESIONES opcional)
 BOARD_MAP: Dict[int, Dict[str, str]] = {
     2147303762: {  # REOS BOT LIFEWAY (padre)
@@ -75,7 +89,7 @@ BOARD_MAP: Dict[int, Dict[str, str]] = {
         "enlace": "text_mkqrp4gr",
         "imagenes": "archivo8__1",
         "catastro": "texto_mkmm8w8t",
-        "fecha_visita": "date_mkq9ggyk",  # Fecha (día de visita)
+        "fecha_visita": "date_mkq9ggyk",  # Día de visita
         "nolon": "numeric_mkrfw72b",      # NOLON ID (padre)
         "subitems": "subitems__1",
     },
@@ -288,7 +302,7 @@ def reason_and_act(history:List[Dict[str,str]], call_sid:str, lang:str, board_id
     messages = [{"role":"system","content":sys}] + history[-12:]
     tools = _tool_defs()
 
-    while True:
+    for _ in range(1):  # un solo ciclo de herramientas para bajar latencia
         try:
             r = requests.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -319,6 +333,7 @@ def reason_and_act(history:List[Dict[str,str]], call_sid:str, lang:str, board_id
                         "name": name,
                         "content": json.dumps(res, ensure_ascii=False)
                     })
+                # tras un loop, pedimos output final
                 continue
 
             return msg.get("content") or "¿En qué más puedo ayudarte?"
@@ -327,7 +342,15 @@ def reason_and_act(history:List[Dict[str,str]], call_sid:str, lang:str, board_id
             log.exception("reason_and_act")
             return "Se me fue un cable, pero ya está. ¿Me repites lo que necesitas?"
 
-# ------------- ElevenLabs TTS -------------
+    # Segundo pase para que cierre con texto si hubo tool
+    try:
+        messages.append({"role":"system","content":"Resume en 1-2 frases y ofrece siguiente paso (visita o WhatsApp)."})
+        out = _openai_chat(messages, temperature=0.2)
+        return out or "¿En qué más puedo ayudarte?"
+    except Exception:
+        return "¿En qué más puedo ayudarte?"
+
+# ------------- ElevenLabs TTS (con cache y FAST_MODE) -------------
 def eleven_tts_to_bytes(text: str) -> bytes:
     if not ELEVEN_API_KEY:
         return b""
@@ -342,6 +365,13 @@ def eleven_tts_to_bytes(text: str) -> bytes:
     return r.content
 
 def speak(vr: VoiceResponse, text: str, lang: str, base_url: str):
+    # Respuestas cortas y FAST_MODE → <Say> instantáneo
+    short = len(text) <= 140
+    if FAST_MODE and short:
+        vr.say(text, language="es-ES")
+        return
+
+    # Traducción mínima si fuese necesario
     speak_text = text
     if lang == "en":
         try:
@@ -359,14 +389,28 @@ def speak(vr: VoiceResponse, text: str, lang: str, base_url: str):
             )
         except Exception:
             pass
+
+    # Cache por hash de texto+lang
+    key = hashlib.sha1((lang+"|"+speak_text).encode("utf-8")).hexdigest()
+    now = time.time()
+    memo = _AUDIO_MEMO.get(key)
+    if memo and now - memo.get("ts", 0) < AUDIO_CACHE_TTL:
+        aid = str(uuid.uuid4()); AUDIO_STORE[aid] = memo["bytes"]
+        vr.play(f"{base_url}/audio/{aid}.mp3")
+        return
+
+    # ElevenLabs
     try:
         audio = eleven_tts_to_bytes(speak_text)
         if audio:
+            _AUDIO_MEMO[key] = {"ts": now, "bytes": audio}
             aid = str(uuid.uuid4()); AUDIO_STORE[aid] = audio
             vr.play(f"{base_url}/audio/{aid}.mp3")
             return
     except Exception:
         log.exception("TTS error")
+
+    # Fallback Twilio <Say>
     vr.say(text, language="es-ES")
 
 # ------------- Monday helpers -------------
@@ -460,7 +504,13 @@ def _price(s: str) -> Optional[float]:
     try: return float("".join(nums))
     except: return None
 
-def board_items_page(board_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+def board_items_page(board_id: int, limit: int = 300) -> List[Dict[str, Any]]:
+    # cache
+    now = time.time()
+    cached = _BOARD_CACHE.get(board_id)
+    if cached and now - cached.get("ts", 0) < BOARD_CACHE_TTL:
+        return cached.get("items", [])
+
     items=[]; cursor=None; remaining=limit
     while remaining>0:
         chunk=min(50, remaining)
@@ -468,7 +518,11 @@ def board_items_page(board_id: int, limit: int = 200) -> List[Dict[str, Any]]:
         query($ids:[ID!], $limit:Int!, $cursor:String){
           boards(ids:$ids){
             items_page(limit:$limit, cursor:$cursor){
-              items{ id name column_values{ id text } }
+              items{
+                id
+                name
+                column_values{ id text }
+              }
               cursor
             }
           }
@@ -479,16 +533,32 @@ def board_items_page(board_id: int, limit: int = 200) -> List[Dict[str, Any]]:
         cursor = page.get("cursor")
         if not cursor: break
         remaining -= chunk
+
+    _BOARD_CACHE[board_id] = {"ts": now, "items": items}
     return items
 
 def extract_nolon_candidate(text: str) -> Optional[str]:
+    """Detecta NOLON tipo '597.444' o '597444', y también códigos tipo CG388690001."""
     if not text: return None
-    for m in re.finditer(r"\d[\d\.\s]{2,}\d", text):
-        cand=_digits(m.group(0))
-        if 5 <= len(cand) <= 9:
-            return cand
-    only=_digits(text)
-    if 5 <= len(only) <= 9: return only
+    # 1) NOLON numérico con o sin puntos/espacios
+    m = re.search(r"\b(\d{3}[\.\s]?\d{3,})\b", text)
+    if m:
+        return _digits(m.group(1))
+    # 2) Códigos estilo CG\d+ (los buscamos en 'name' también)
+    m2 = re.search(r"\b([A-Z]{1,3}\d{5,})\b", text, flags=re.I)
+    if m2:
+        return m2.group(1).upper()
+    # 3) Si todo son dígitos largos
+    only = _digits(text)
+    if 5 <= len(only) <= 12:
+        return only
+    return None
+
+def find_by_code(board_id:int, code:str) -> Optional[Dict[str,Any]]:
+    code_norm = code.strip().upper()
+    for it in board_items_page(board_id, 300):
+        if (it.get("name") or "").strip().upper() == code_norm:
+            return it
     return None
 
 def find_by_nolon(board_id: int, nolon_digits: str) -> Optional[Dict[str, Any]]:
@@ -496,7 +566,7 @@ def find_by_nolon(board_id: int, nolon_digits: str) -> Optional[Dict[str, Any]]:
     col = m.get("nolon")
     if not col: return None
     for it in board_items_page(board_id, 300):
-        if _digits(_get_text(it, col)) == nolon_digits:
+        if re.fullmatch(r"\d+", nolon_digits) and _digits(_get_text(it, col)) == nolon_digits:
             return it
     return None
 
@@ -530,14 +600,32 @@ def find_by_city(items, m, city) -> List[Dict[str, Any]]:
 
 def search_flexible(board_id:int, text:str)->Optional[Dict[str,Any]]:
     if not text: return None
-    nolon = extract_nolon_candidate(text)
-    log.info("search_flexible: nolon=%s", nolon)
-    if nolon:
-        it = find_by_nolon(board_id, nolon)
+    ref = extract_nolon_candidate(text)
+    log.info("search_flexible: ref=%s", ref)
+
+    # NOLON numérico → columna NOLON
+    if ref and ref.isdigit():
+        it = find_by_nolon(board_id, ref)
         if it: return it
 
-    items = board_items_page(board_id, 300)
+    # Código tipo CG... → nombre exacto
+    if ref and not ref.isdigit():
+        it = find_by_code(board_id, ref)
+        if it: return it
+
+    # Filtro rápido por ciudad si la frase es corta
     m = BOARD_MAP.get(board_id, BOARD_MAP[MONDAY_DEFAULT_BOARD_ID])
+    items = board_items_page(board_id, 300)
+    toks = _norm(text).split()
+    city = None
+    if len(toks) <= 4:
+        city = _norm(text)
+    if city:
+        lst = find_by_city(items, m, city)
+        if lst:
+            return lst[0]
+
+    # Score por dirección/nombre/población + precio
     budget = _price(text)
     address = text
     best=None; best_sc=-1.0
@@ -681,23 +769,36 @@ def gather():
             speak(vr, "No te he escuchado bien. ¿Puedes repetirlo?", st.get("lang","es"), base)
             vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        # Detección rápida de idioma y NLU (por si hace falta)
+        # Detección rápida de idioma
         lang = "ar" if re.search(r"[\u0600-\u06FF]", speech) else (st.get("lang") or "es")
-        info = nlu_extract(speech)
-        if info.get("lang"): lang = info["lang"]
         st["lang"] = lang
 
-        # ====== AGENTE GENERAL CON HERRAMIENTAS ======
+        # ---------- VIA RÁPIDA (SIN LLM) ----------
+        quick_ref = extract_nolon_candidate(speech)
+        short_hint = len(speech.split()) <= 7  # frases cortas con ciudad/calle/precio
+
+        if quick_ref or short_hint:
+            it = search_flexible(board_id, speech)
+            if it:
+                resumen = say_summary(it, board_id, lang)
+                st["last_item_id"] = int(it["id"])
+                extra = ""
+                if from_num.startswith("+"):
+                    extra = " Si quieres, te envío la ficha por WhatsApp ahora mismo. ¿Te apunto para la visita?"
+                speak(vr, resumen + ". " + extra, lang, base)
+                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+
+        # ---------- AGENTE (LLM + tools) ----------
+        info = nlu_extract(speech)
+        if info.get("lang"):
+            st["lang"] = info["lang"]; lang = info["lang"]
+
         st["history"].append({"role":"user","content":speech})
         st["history"] = st["history"][-20:]
-
-        # si hay contacto completo y ya se identificó la propiedad, el agente podrá llamar a book_visit_subitem;
-        # para comodidad, dejamos el teléfono detectado en historial también si viene de Twilio
-        if from_num.startswith("+") and not info.get("phone"):
+        if from_num.startswith("+"):
             st["history"].append({"role":"system","content":f"Teléfono que llama: {from_num}"})
 
         agent_reply = reason_and_act(st["history"], call_sid, lang, board_id)
-
         st["history"].append({"role":"assistant","content":agent_reply})
 
         speak(vr, agent_reply, lang, base)
