@@ -1,5 +1,21 @@
 # app.py — Lifeway Voice Bot (rápido, conversacional y robusto)
 # Twilio (voz) + ElevenLabs TTS + Monday (REOS) + WhatsApp + subelementos
+#
+# ENV necesarios (Render):
+# OPENAI_API_KEY
+# OPENAI_MODEL (opcional, por defecto "gpt-4o-mini")
+# ELEVEN_API_KEY (o ELEVENLABS_API_KEY)
+# ELEVEN_VOICE_ID (o ELEVENLABS_VOICE_ID)
+# TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_E164  (p.ej. "+34930348966")
+# MONDAY_API_KEY (o monday_api)
+# MONDAY_DEFAULT_BOARD_ID=2147303762   # REOS BOT LIFEWAY (padre)
+# SUB_REOS_NAME_COL_ID=name
+# SUB_REOS_NOLON_COL_ID=text_mkvs87qt
+# SUB_REOS_DATE_COL_ID=date0
+# SUB_REOS_PHONE_COL_ID=phone_mks7jjxp
+# SUB_REOS_EMAIL_COL_ID=email_mks7kagf
+# SUB_REOS_STATUS_COL_ID=color_mkvst8na
+# OPS_TOKEN  (para /ops/book-visit)
 
 import os, io, json, time, uuid, logging, re
 from typing import Any, Dict, Optional, List
@@ -105,7 +121,7 @@ def _sess(call_sid: str) -> Dict[str, Any]:
 # ------------- OpenAI (rápido) -------------
 def _openai_chat(messages, temperature=0.3) -> str:
     if not OPENAI_API_KEY:
-        return "[]"
+        return ""
     r = requests.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
@@ -117,24 +133,35 @@ def _openai_chat(messages, temperature=0.3) -> str:
 
 def nlu_extract(user_text: str) -> Dict[str, Any]:
     """
-    Parser ligero: ciudad / dirección / presupuesto / sí-no / nombre / teléfono / email / idioma.
-    Devuelve JSON. Robusto ante fallos.
+    Parser ligero y ROBUSTO: ciudad / dirección / presupuesto / sí-no / nombre / teléfono / email / idioma.
+    Pase lo que pase, devuelve un dict válido (nunca lanza JSONDecodeError).
     """
     sys = (
         "Devuelve SOLO JSON válido con claves:"
         "{'city':str|null,'address':str|null,'budget':float|null,'yesno':'yes'|'no'|null,"
         "'name':str|null,'phone':str|null,'email':str|null,'lang':'es'|'ar'|'en'}."
-        " Si hay número de referencia tipo 597.444, NO lo pongas; ya lo detecto aparte."
-        " Si no sabes, usa null. Detecta árabe si hay escritura árabe."
+        " Si no sabes, usa null."
     )
+    # fallback por defecto (incluye detección simple de árabe)
+    fallback_lang = "ar" if re.search(r"[\u0600-\u06FF]", user_text or "") else "es"
+    fallback = {"city":None,"address":None,"budget":None,"yesno":None,"name":None,"phone":None,"email":None,"lang":fallback_lang}
     try:
         out = _openai_chat([{"role":"system","content":sys},{"role":"user","content":user_text}], temperature=0.1)
-        return json.loads(out)
+        if not out or not out.strip():
+            return fallback
+        # si el modelo respondió texto normal, NO intentamos json: devolvemos fallback
+        if out.strip()[0] not in "{[":
+            return fallback
+        parsed = json.loads(out)
+        if not isinstance(parsed, dict):
+            return fallback
+        for k in fallback.keys():
+            if k not in parsed:
+                parsed[k] = fallback[k]
+        return parsed
     except Exception:
         log.exception("nlu_extract")
-        # fallback muy conservador
-        lang = "ar" if re.search(r"[\u0600-\u06FF]", user_text or "") else "es"
-        return {"city":None,"address":None,"budget":None,"yesno":None,"name":None,"phone":None,"email":None,"lang":lang}
+        return fallback
 
 # ------------- ElevenLabs TTS -------------
 def eleven_tts_to_bytes(text: str) -> bytes:
@@ -257,7 +284,7 @@ def human_date(iso: Optional[str]) -> str:
     except Exception:
         return iso or ""
 
-# ------------- Búsqueda rápida -------------
+# ------------- Búsqueda rápida y FLEXIBLE -------------
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9áéíóúüñ ]"," ", (s or "").lower())
 
@@ -312,14 +339,28 @@ def find_by_nolon(board_id: int, nolon_digits: str) -> Optional[Dict[str, Any]]:
     return None
 
 def score_item(item, m, address, budget) -> float:
-    dir_ = _get_text(item, m["direccion"])
+    # Coincidencias en dirección, nombre y población; umbral más bajo
+    dir_   = _get_text(item, m["direccion"])
+    name_  = item.get("name","")
+    pob_   = _get_text(item, m["poblacion"])
     price_txt = _get_text(item, m["precio_main"]) or _get_text(item, m["precio_alt"])
     price = _price(price_txt)
-    sc=0.0
-    if address and _norm(address) in _norm(dir_): sc += 3.0
-    if budget and price and abs(price-budget) <= 0.2*budget: sc += 2.0
-    if _norm(address) in _norm(item.get("name","")): sc += 1.0
-    return sc
+
+    s = 0.0
+    adr = _norm(address or "")
+    if adr:
+        if adr in _norm(dir_):  s += 2.5
+        if adr in _norm(name_): s += 1.0
+        if adr in _norm(pob_):  s += 1.0
+        # tokens sueltos (calle/palabras)
+        toks = [t for t in re.split(r"\s+", adr) if len(t) >= 4]
+        hit = sum(1 for t in toks if t in _norm(dir_) or t in _norm(name_) or t in _norm(pob_))
+        s += 0.5 * min(hit, 3)
+    if budget and price:
+        # tolerancia amplia ±25%
+        if abs(price - budget) <= 0.25 * budget:
+            s += 1.5
+    return s
 
 def find_by_city(items, m, city) -> List[Dict[str, Any]]:
     out=[]
@@ -327,6 +368,30 @@ def find_by_city(items, m, city) -> List[Dict[str, Any]]:
         if _norm(city) in _norm(_get_text(it, m["poblacion"])):
             out.append(it)
     return out
+
+def search_flexible(board_id:int, text:str)->Optional[Dict[str,Any]]:
+    """
+    1) Si detecta NOLON (con o sin puntos/espacios) intenta match directo.
+    2) Si no, puntúa por dirección/nombre/población y precio con umbral bajo.
+    Devuelve el mejor item o None.
+    """
+    if not text: return None
+    nolon = extract_nolon_candidate(text)
+    log.info("search_flexible: nolon=%s", nolon)
+    if nolon:
+        it = find_by_nolon(board_id, nolon)
+        if it: return it
+
+    items = board_items_page(board_id, 300)
+    m = BOARD_MAP.get(board_id, BOARD_MAP[MONDAY_DEFAULT_BOARD_ID])
+    budget = _price(text)
+    address = text
+    best=None; best_sc=-1.0
+    for it in items:
+        sc = score_item(it, m, address, budget)
+        if sc > best_sc:
+            best_sc, best = sc, it
+    return best if (best and best_sc >= 1.0) else None
 
 # ------------- WhatsApp -------------
 def _twilio_params_wa(to_e164: str) -> Dict[str, Any]:
@@ -371,7 +436,7 @@ def create_subitem_contact(parent_item_id:int, board_id:int,
     except Exception:
         return None
 
-    cols = sub_cols_reos()  # por ahora REOS (si añades CESIONES, replica)
+    cols = sub_cols_reos()
     payload={}
     if cols.get("name") and name:   payload[cols["name"]]  = name
     if cols.get("phone") and phone: payload[cols["phone"]] = phone
@@ -482,15 +547,17 @@ def gather():
             speak(vr, "No te he escuchado bien. ¿Puedes repetirlo?", st.get("lang","es"), base)
             vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
+        log.info("CALL %s | speech='%s'", call_sid, speech)
+
         st["history"].append({"role":"user","content":speech})
         if len(st["history"])>20: st["history"]=st["history"][-20:]
 
-        # --- Detección de idioma rápida
+        # --- Detección de idioma rápida + NLU robusto
         lang = "ar" if re.search(r"[\u0600-\u06FF]", speech) else (st.get("lang") or "es")
-        # NLU ligero para ciudad/calle/precio/sí-no/etc.
         info = nlu_extract(speech)
         if info.get("lang"): lang = info["lang"]
         st["lang"] = lang
+        log.info("info=%s", info)
 
         # --- 1) Intento directo por NOLON
         nolon = extract_nolon_candidate(speech)
@@ -498,7 +565,6 @@ def gather():
             it = find_by_nolon(board_id, nolon)
             if it:
                 st["item_id"] = int(it["id"])
-                # Resumen y oferta
                 speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
                 st["step"] = "await_book_confirm"
                 vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
@@ -506,26 +572,22 @@ def gather():
                 speak(vr, "No encuentro esa referencia. ¿Me das la calle, la población o el precio aproximado?", lang, base)
                 st["step"] = None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        # --- Máquina de estados muy breve y natural ---
-        # Si ya tenemos item_id, vamos a confirmar la visita rápido
+        # --- Máquina de estados breve ---
         if st.get("item_id") and st.get("step") in (None, "offer_day"):
             it = monday_get_item(st["item_id"])
             speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
             st["step"] = "await_book_confirm"
             vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        # Si esperamos confirmación de anotar visita
         if st.get("step") == "await_book_confirm":
             if (info.get("yesno") == "no") or re.search(r"\b(no|más tarde|otro)\b", _norm(speech)):
                 speak(vr, "De acuerdo. ¿Quiere ver otra zona o necesita más detalles?", lang, base)
                 st["step"] = None; st.pop("item_id", None)
                 vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-            # Sí por defecto
             speak(vr, say_collect_contact(lang), lang, base)
             st["step"] = "collect_contact"
             vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        # Si estamos recogiendo contacto
         if st.get("step") == "collect_contact":
             name  = info.get("name")  or "Interesado"
             phone = info.get("phone") or (from_num if from_num.startswith("+") else "")
@@ -535,7 +597,6 @@ def gather():
                 speak(vr, "Se me ha perdido la referencia. ¿Me recuerdas la dirección o la referencia NOLON?", lang, base)
                 st["step"] = None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-            # Crear subelemento con datos + copiar fecha/nolon
             it = monday_get_item(item_id)
             m = BOARD_MAP.get(board_id, BOARD_MAP[MONDAY_DEFAULT_BOARD_ID])
             fecha_iso = _get_date(it, m["fecha_visita"])
@@ -545,10 +606,9 @@ def gather():
                                    name=name, phone=phone, email=email,
                                    date_iso=fecha_iso, nolon_text=nolon_text)
 
-            # WhatsApp confirmación + imágenes
             try:
                 if phone.startswith("+") and _twilio is not None:
-                    resumen = say_summary(it, board_id, "es")  # texto en ES al WhatsApp
+                    resumen = say_summary(it, board_id, "es")
                     wa_text(phone, "Reserva anotada.\n\n" + resumen)
                     imgs = extract_images(it, board_id)
                     if imgs: wa_images(phone, imgs)
@@ -559,60 +619,82 @@ def gather():
             st["step"] = None; st.pop("item_id", None)
             vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        # --- 2) Búsqueda rápida por ciudad/calle/precio y desambiguación ligera ---
+        # --- 2) Búsqueda rápida + flexible ---
         city    = info.get("city")
         address = info.get("address")
         budget  = info.get("budget")
+
         items = board_items_page(board_id, 200)
         m = BOARD_MAP.get(board_id, BOARD_MAP[MONDAY_DEFAULT_BOARD_ID])
 
-        # Si solo ciudad -> pide detalle
         if city and not (address or budget):
             cand = find_by_city(items, m, city)
             if not cand:
-                speak(vr, f"No he encontrado inmuebles en {city}. ¿Buscamos otra zona?", lang, base)
+                best = search_flexible(board_id, speech)
+                if best:
+                    st["item_id"] = int(best["id"])
+                    it = monday_get_item(st["item_id"])
+                    speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
+                    st["step"] = "await_book_confirm"
+                    vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+                speak(vr, f"No localizo inmuebles en {city}. ¿Probamos con la calle o la referencia?", lang, base)
                 st["step"] = None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-            st["cand"] = cand; st["step"] = "need_detail"
-            speak(vr, say_ask_details(city, lang), lang, base)
-            vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        # Si tenemos dirección o presupuesto -> elige la mejor
-        if address or budget:
             best=None; best_sc=-1.0
-            for it in items:
-                sc = score_item(it, m, address or "", budget)
+            adr = address or speech
+            for it in cand:
+                sc = score_item(it, m, adr, budget)
                 if sc > best_sc:
                     best_sc, best = sc, it
-            if best and best_sc >= 2.0:
-                st["item_id"] = int(best["id"]); st["step"]="offer_day"
+            if best and best_sc >= 1.0:
+                st["item_id"] = int(best["id"])
                 it = monday_get_item(st["item_id"])
                 speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-                st["step"]="await_book_confirm"
+                st["step"] = "await_book_confirm"
                 vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-            else:
-                speak(vr, "No me queda claro cuál es. ¿Me dices la calle exacta o la referencia?", lang, base)
-                st["step"]=None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        # Si venimos de ciudad con candidatos y ahora da más detalle
+            speak(vr, say_ask_details(city, lang), lang, base)
+            st["step"] = "need_detail"; st["cand"] = cand
+            vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+
+        if address or budget:
+            best = search_flexible(board_id, address or speech)
+            if best:
+                st["item_id"] = int(best["id"])
+                it = monday_get_item(st["item_id"])
+                speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
+                st["step"] = "await_book_confirm"
+                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+            speak(vr, "No me queda claro cuál es. ¿Me dices la calle exacta o la referencia NOLON?", lang, base)
+            st["step"] = None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+
         if st.get("step") == "need_detail":
             cand = st.get("cand") or []
-            address = address or speech
-            budget  = budget
             best=None; best_sc=-1.0
+            adr = address or speech
             for it in cand:
-                sc=score_item(it, m, address or "", budget)
-                if sc>best_sc:
+                sc = score_item(it, m, adr, budget)
+                if sc > best_sc:
                     best_sc, best = sc, it
-            if best and best_sc >= 2.0:
+            if best and best_sc >= 1.0:
                 st["item_id"] = int(best["id"])
-                speak(vr, say_summary(best, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-                st["step"]="await_book_confirm"
-                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-            else:
-                speak(vr, "¿Tienes la calle o el precio aproximado? Así la ubico mejor.", lang, base)
+                it = monday_get_item(st["item_id"])
+                speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
+                st["step"] = "await_book_confirm"
                 vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        # Fallback amable y corto
+            best = search_flexible(board_id, speech)
+            if best:
+                st["item_id"] = int(best["id"])
+                it = monday_get_item(st["item_id"])
+                speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
+                st["step"] = "await_book_confirm"
+                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+
+            speak(vr, "¿Tienes la calle o la referencia? Con eso lo ubico al momento.", lang, base)
+            vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+
+        # Fallback amable
         speak(vr, "Para ayudarte, dime la dirección, la población, el precio aproximado o la referencia NOLON.", lang, base)
         vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
