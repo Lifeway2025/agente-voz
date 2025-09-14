@@ -284,6 +284,7 @@ def voice_inbound():
     vr.pause(length=1)
     vr.redirect("/voice")
     return Response(str(vr), mimetype="application/xml")
+    vr.record(max_length=30, play_beep=True)
 
 @app.post("/gather")
 def gather_handler():
