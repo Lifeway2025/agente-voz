@@ -11,68 +11,85 @@ from email.utils import formataddr
 from typing import Any, Dict, Optional
 
 import requests
-from flask import Flask, request, Response, abort, send_file, jsonify
+from flask import Flask, request, Response, abort, send_file
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client as TwilioClient
 
 # ======================
-#   CONFIG / ENV VARS
+# Utilidades seguras de ENV
+# ======================
+
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    return v.strip() if isinstance(v, str) else default
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(_env_str(name, str(default)))
+    except Exception:
+        logging.warning("ENV %s inválida, usando %s", name, default)
+        return default
+
+# ======================
+# Config / ENV VARS
 # ======================
 
 # OpenAI
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY  = _env_str("OPENAI_API_KEY")
+OPENAI_MODEL    = _env_str("OPENAI_MODEL", "gpt-4o-mini")
 
-# Twilio (WhatsApp + Voice)
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN", "")
-# Prioriza el +34; compatibilidad con TWILIO_NUMBER antiguo
-TWILIO_PHONE_E164  = os.getenv("TWILIO_PHONE_E164") or os.getenv("TWILIO_NUMBER", "+34930348966")
-MESSAGING_SERVICE_SID = os.getenv("MESSAGING_SERVICE_SID", "")  # MG...
+# Twilio
+TWILIO_ACCOUNT_SID = _env_str("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN  = _env_str("TWILIO_AUTH_TOKEN")
+# Prioriza +34 (nuevo); compatibilidad con TWILIO_NUMBER antiguo
+TWILIO_PHONE_E164  = _env_str("TWILIO_PHONE_E164") or _env_str("TWILIO_NUMBER", "+34930348966")
+MESSAGING_SERVICE_SID = _env_str("MESSAGING_SERVICE_SID")  # MG...
 
-# ElevenLabs (compatibles con nombres previos)
-ELEVEN_API_KEY  = os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY", "")
-ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID") or os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+# ElevenLabs (compatibilidad con nombres previos)
+ELEVEN_API_KEY  = _env_str("ELEVEN_API_KEY") or _env_str("ELEVENLABS_API_KEY")
+ELEVEN_VOICE_ID = _env_str("ELEVEN_VOICE_ID") or _env_str("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 
-# Monday.com (compatibles con nombres previos)
-MONDAY_API_KEY  = os.getenv("MONDAY_API_KEY") or os.getenv("monday_api", "")
+# Monday.com (compatibilidad con nombres previos)
+MONDAY_API_KEY  = _env_str("MONDAY_API_KEY") or _env_str("monday_api")
 MONDAY_API_URL  = "https://api.monday.com/v2"
-MONDAY_BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "0") or "0")
+MONDAY_BOARD_ID = _env_int("MONDAY_BOARD_ID", 0)  # pon el real en Render
 
-# Email por SMTP (OVH)
-MAIL_SMTP_HOST     = env_int("MAIL_SMTP_PORT", 587)     # ej: ssl0.ovh.net
-MAIL_SMTP_PORT     = int(os.getenv("MAIL_SMTP_PORT", "587"))
-MAIL_SMTP_USER     = os.getenv("MAIL_SMTP_USER", "")     # ej: usuario@dominio
-MAIL_SMTP_PASS     = os.getenv("MAIL_SMTP_PASS", "")
-MAIL_SMTP_STARTTLS = (os.getenv("MAIL_SMTP_STARTTLS", "true").lower() == "true")
-MAIL_FROM_EMAIL    = os.getenv("MAIL_FROM_EMAIL", "no-reply@gcaconsulting.es")
-MAIL_FROM_NAME     = os.getenv("MAIL_FROM_NAME", "GCA Consulting")
+# Email por SMTP (OVH u otro)
+MAIL_SMTP_HOST     = _env_str("MAIL_SMTP_HOST")     # ej: ssl0.ovh.net
+MAIL_SMTP_PORT     = _env_int("MAIL_SMTP_PORT", 587)
+MAIL_SMTP_USER     = _env_str("MAIL_SMTP_USER")     # ej: no-reply@gcaconsulting.es
+MAIL_SMTP_PASS     = _env_str("MAIL_SMTP_PASS")
+MAIL_SMTP_STARTTLS = _env_str("MAIL_SMTP_STARTTLS", "true").lower() == "true"
+MAIL_FROM_EMAIL    = _env_str("MAIL_FROM_EMAIL", "no-reply@gcaconsulting.es")
+MAIL_FROM_NAME     = _env_str("MAIL_FROM_NAME", "GCA Consulting")
 
 # Marca / seguridad
-BRAND_NAME = os.getenv("BRAND_NAME", "GCA Consulting")
-OPS_TOKEN  = os.getenv("OPS_TOKEN", "")  # para endpoints /ops/*
+BRAND_NAME = _env_str("BRAND_NAME", "GCA Consulting")
+OPS_TOKEN  = _env_str("OPS_TOKEN")  # requerido para /ops/*
 
 # ======================
-#   APP & GLOBALS
+# Setup app
 # ======================
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gca")
 
-AUDIO_STORE: Dict[str, bytes] = {}  # cache de audios TTS
-_twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+AUDIO_STORE: Dict[str, bytes] = {}  # cache audios TTS
+_twilio: Optional[TwilioClient] = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    _twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # ======================
-#   HELPERS
+# Helpers
 # ======================
 
 def ok_json(data: Any, code: int = 200):
     return Response(json.dumps(data, ensure_ascii=False), status=code, mimetype="application/json")
 
 def _openai_chat(messages, temperature=0.2, response_format: Optional[Dict]=None) -> str:
-    """Llama a OpenAI Chat Completions (HTTP simple)."""
+    """OpenAI Chat (HTTP). Lanza RuntimeError si falta la API key."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -102,7 +119,7 @@ def plan_intent(user_text: str) -> Dict[str, Any]:
         return {"intent": "chitchat", "message": user_text, "property_id": None, "phone": None, "email": None}
 
 def eleven_tts_to_bytes(text: str) -> bytes:
-    """Genera audio MP3 con ElevenLabs (si hay API Key)."""
+    """Genera audio MP3 con ElevenLabs. Devuelve b'' si no hay API key."""
     if not ELEVEN_API_KEY:
         return b""
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
@@ -152,7 +169,9 @@ def build_property_summary(item: Dict[str, Any]) -> str:
 def send_whatsapp(to_e164: str, body: Optional[str]=None,
                   content_sid: Optional[str]=None,
                   content_vars: Optional[Dict[str,Any]]=None) -> str:
-    """Envía WhatsApp con texto libre o plantilla."""
+    """Envía WhatsApp (Twilio). Lanza RuntimeError si Twilio no está configurado."""
+    if _twilio is None:
+        raise RuntimeError("Twilio credentials not configured")
     params = {"to": f"whatsapp:{to_e164}", "from_": f"whatsapp:{TWILIO_PHONE_E164}"}
     if MESSAGING_SERVICE_SID:
         params["messaging_service_sid"] = MESSAGING_SERVICE_SID
@@ -166,9 +185,9 @@ def send_whatsapp(to_e164: str, body: Optional[str]=None,
     return msg.sid
 
 def send_email(to_email: str, subject: str, html: str) -> Dict[str, Any]:
-    """Envío de email por SMTP (OVH)."""
+    """Email por SMTP (STARTTLS si MAIL_SMTP_STARTTLS=True)."""
     if not MAIL_SMTP_HOST:
-        raise RuntimeError("MAIL_SMTP_* no configurado")
+        return {"ok": False, "error": "MAIL_SMTP_* not configured"}
     msg = MIMEText(html, "html", "utf-8")
     msg["Subject"] = subject
     msg["From"] = formataddr((MAIL_FROM_NAME, MAIL_FROM_EMAIL))
@@ -182,10 +201,11 @@ def send_email(to_email: str, subject: str, html: str) -> Dict[str, Any]:
             s.sendmail(MAIL_FROM_EMAIL, [to_email], msg.as_string())
         return {"ok": True}
     except Exception as e:
+        logging.exception("SMTP error")
         return {"ok": False, "error": str(e)}
 
 # ======================
-#   ROUTES
+# Rutas
 # ======================
 
 @app.get("/healthz")
@@ -199,7 +219,7 @@ def serve_audio(audio_id: str):
         abort(404)
     return send_file(io.BytesIO(data), mimetype="audio/mpeg", download_name=f"{audio_id}.mp3")
 
-# ---------- WhatsApp / SMS (Entrante) ----------
+# ---- WhatsApp / SMS (Entrante) ----
 @app.post("/whatsapp")
 def whatsapp_inbound():
     from_ = request.values.get("From", "")
@@ -246,7 +266,7 @@ def whatsapp_inbound():
         reply.message("Error procesando la solicitud. Probemos en un momento.")
     return Response(str(reply), mimetype="application/xml")
 
-# ---------- Voice (Entrante) ----------
+# ---- Voice (Entrante) ----
 @app.post("/voice")
 def voice_inbound():
     vr = VoiceResponse()
@@ -328,9 +348,9 @@ def gather_handler():
     vr.hangup()
     return Response(str(vr), mimetype="application/xml")
 
-# ---------- OPS / utilidades ----------
+# ---- OPS / utilidades ----
 def _require_ops():
-    if request.headers.get("X-Auth") != OPS_TOKEN:
+    if not OPS_TOKEN or request.headers.get("X-Auth") != OPS_TOKEN:
         abort(403)
 
 @app.post("/ops/send-whatsapp")
@@ -355,7 +375,7 @@ def ops_send_email():
 @app.post("/ops/test-email")
 def ops_test_email():
     _require_ops()
-    to = request.args.get("to") or request.json.get("to")
+    to = (request.args.get("to") or (request.json or {}).get("to"))
     if not to:
         return ok_json({"ok": False, "error": "Parámetro 'to' requerido"}, 400)
     r = send_email(to, f"[{BRAND_NAME}] Test SMTP", "<p>Test OK</p>")
@@ -364,8 +384,8 @@ def ops_test_email():
 @app.post("/ops/test-wa")
 def ops_test_wa():
     _require_ops()
-    to = request.args.get("to") or request.json.get("to")
-    text = (request.args.get("text") or request.json.get("text") or
+    to = (request.args.get("to") or (request.json or {}).get("to"))
+    text = (request.args.get("text") or (request.json or {}).get("text") or
             f"Mensaje de prueba desde {BRAND_NAME}")
     if not to:
         return ok_json({"ok": False, "error": "Parámetro 'to' requerido"}, 400)
@@ -373,8 +393,8 @@ def ops_test_wa():
     return ok_json({"ok": True, "sid": sid})
 
 # ======================
-#   MAIN
+# Main
 # ======================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+    app.run(host="0.0.0.0", port=_env_int("PORT", 5000), debug=False)
