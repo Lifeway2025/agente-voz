@@ -332,49 +332,125 @@ def whatsapp_inbound():
 @app.post("/voice")
 def voice_inbound():
     vr = VoiceResponse()
-    # Para grabar la llamada (código Meta), descomenta:
+    # Si quieres guardar la locución de verificación de Meta:
     # vr.record(max_length=30, play_beep=False)
 
-    t = f"Bienvenido a {BRAND_NAME}. Después del tono, cuéntame qué necesitas."
-    a = eleven_tts_to_bytes(t)
-    if a:
-        aid=str(uuid.uuid4()); AUDIO_STORE[aid]=a
-        vr.play(f"{request.url_root.rstrip('/')}/audio/{aid}.mp3")
+    bienvenida = (f"Hola, soy el asistente de {BRAND_NAME}. "
+                  "Dime el número de referencia o el nombre del inmueble que te interesa. "
+                  "Puedo contarte sus características, la fecha de visita disponible y, si quieres, te la agendo.")
+    audio_bytes = eleven_tts_to_bytes(bienvenida)
+    if audio_bytes:
+        audio_id = str(uuid.uuid4()); AUDIO_STORE[audio_id] = audio_bytes
+        vr.play(f"{request.url_root.rstrip('/')}/audio/{audio_id}.mp3")
     else:
-        vr.say(t, language="es-ES")
+        vr.say(bienvenida, language="es-ES")
 
-    g = Gather(input="speech dtmf", timeout=6, num_digits=1, action="/gather",
-               speech_timeout="auto", language="es-ES")
-    vr.append(g); vr.pause(length=1); vr.redirect("/voice")
+    g = Gather(input="speech", timeout=7, action="/gather", speech_timeout="auto", language="es-ES")
+    vr.append(g)
+    vr.pause(length=1)
+    vr.redirect("/voice")
     return Response(str(vr), mimetype="application/xml")
 
 @app.post("/gather")
 def gather_handler():
     speech = (request.values.get("SpeechResult") or "").strip()
+    caller = (request.values.get("From") or "").replace("whatsapp:", "")
     board_id = _board_from_request()
     vr = VoiceResponse()
     try:
-        plan = plan_intent(speech or ""); board_id = int(plan.get("board_id") or board_id)
-        txt = ""
-        if plan.get("intent") == "search_property":
-            pid = int(str(plan.get("property_id") or "0"))
-            item = monday_get_item(pid) if pid else {}
-            txt = "He encontrado: " + build_property_summary(item, board_id).replace("\n",". ")
+        # Entendemos intención (añadimos 'schedule_visit' al plan)
+        sys = ("Eres un asistente inmobiliario. Devuelve SOLO JSON con estos campos:"
+               "{'intent':'search_property|schedule_visit|chitchat',"
+               " 'property_id':str|null, 'email':str|null, 'message':str|null}")
+        intent = json.loads(_openai_chat(
+            [{"role":"system","content":sys}, {"role":"user","content": speech}],
+            temperature=0.2
+        ))
+        intent_name = intent.get("intent") or "chitchat"
+        prop_id = intent.get("property_id")
+        correo  = intent.get("email")
+
+        if intent_name == "search_property" and prop_id:
+            item = monday_get_item(int(str(prop_id)))
+            resumen = build_property_summary(item, board_id).replace("\n", ". ")
+            texto = (resumen + ". Si quieres, te puedo agendar la visita para esa fecha. "
+                     "Solo dime: 'sí, confírmala', o indícame otra fecha.")
+            a = eleven_tts_to_bytes(texto)
+            if a:
+                aid=str(uuid.uuid4()); AUDIO_STORE[aid]=a
+                vr.play(f"{request.url_root.rstrip('/')}/audio/{aid}.mp3")
+            else:
+                vr.say(texto, language="es-ES")
+            # volvemos a escuchar
+            g = Gather(input="speech", timeout=6, action="/gather", speech_timeout="auto", language="es-ES")
+            vr.append(g)
+
+        elif intent_name == "schedule_visit" and prop_id:
+            item = monday_get_item(int(str(prop_id)))
+            m = BOARD_MAP.get(board_id, BOARD_MAP[MONDAY_DEFAULT_BOARD_ID])
+            fecha_iso = _get_date(item, m["fecha_visita"])
+            # si hay fecha, programamos a las 11:00 UTC por defecto (ajusta a tu zona si quieres)
+            if fecha_iso:
+                start_iso = fecha_iso + "T11:00:00+00:00"  # simplificación
+                # Confirmación por WhatsApp al número llamante (si es E.164)
+                try:
+                    summary_txt = build_property_summary(item, board_id)
+                    send_whatsapp_text(caller if caller.startswith("+") else "", 
+                                       f"Visita confirmada para { _fmt_fecha_humana(fecha_iso) } a las 11:00.\n\n{summary_txt}")
+                    imgs = extract_image_urls(item, board_id)
+                    send_whatsapp_images(caller if caller.startswith("+") else "", imgs)
+                except Exception:
+                    pass
+
+                texto = (f"Perfecto. He agendado tu visita para el { _fmt_fecha_humana(fecha_iso) } a las once. "
+                         "Te acabo de enviar los detalles por WhatsApp.")
+                a = eleven_tts_to_bytes(texto)
+                if a:
+                    aid=str(uuid.uuid4()); AUDIO_STORE[aid]=a
+                    vr.play(f"{request.url_root.rstrip('/')}/audio/{aid}.mp3")
+                else:
+                    vr.say(texto, language="es-ES")
+
+                # (Opcional) si dijo un email, mandamos .ics
+                if correo:
+                    ics = create_ics_summary(start_iso, item.get("name","Visita inmueble"),
+                                             "Visita a inmueble programada con Lifeway", 30)
+                    send_ics_email(correo, f"[{BRAND_NAME}] Confirmación de visita", ics)
+
+                vr.hangup()
+            else:
+                msg = ("No tengo fecha de visita disponible en la ficha. "
+                       "¿Quieres que te envíe la información por WhatsApp y te contactemos para acordarla?")
+                a = eleven_tts_to_bytes(msg)
+                if a:
+                    aid=str(uuid.uuid4()); AUDIO_STORE[aid]=a
+                    vr.play(f"{request.url_root.rstrip('/')}/audio/{aid}.mp3")
+                else:
+                    vr.say(msg, language="es-ES")
+                g = Gather(input="speech", timeout=6, action="/gather", speech_timeout="auto", language="es-ES")
+                vr.append(g)
+
         else:
-            txt = _openai_chat(
-                [{"role":"system","content":f"Eres asistente telefónico de {BRAND_NAME}."},
+            # charla breve de cortesía
+            chat = _openai_chat(
+                [{"role":"system","content":f"Eres asistente telefónico de {BRAND_NAME}. Sé directo y útil."},
                  {"role":"user","content": speech}]
             )
-        a = eleven_tts_to_bytes(txt or "De acuerdo.")
-        if a:
-            aid=str(uuid.uuid4()); AUDIO_STORE[aid]=a
-            vr.play(f"{request.url_root.rstrip('/')}/audio/{aid}.mp3")
-        else:
-            vr.say(txt or "De acuerdo.", language="es-ES")
-    except Exception:
-        logger.exception("gather error"); vr.say("Ha ocurrido un error.", language="es-ES")
-    vr.hangup(); return Response(str(vr), mimetype="application/xml")
+            a = eleven_tts_to_bytes(chat)
+            if a:
+                aid=str(uuid.uuid4()); AUDIO_STORE[aid]=a
+                vr.play(f"{request.url_root.rstrip('/')}/audio/{aid}.mp3")
+            else:
+                vr.say(chat, language="es-ES")
+            g = Gather(input="speech", timeout=6, action="/gather", speech_timeout="auto", language="es-ES")
+            vr.append(g)
 
+    except Exception:
+        logging.exception("gather error")
+        vr.say("Ha ocurrido un problema procesando tu petición. Probemos de nuevo.", language="es-ES")
+        vr.redirect("/voice")
+
+    return Response(str(vr), mimetype="application/xml")
 # --- OPS ---
 def _require_ops():
     if not OPS_TOKEN or request.headers.get("X-Auth") != OPS_TOKEN: abort(403)
