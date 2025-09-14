@@ -1,11 +1,11 @@
-# app.py — Lifeway Voice Bot (rápido, conversacional y robusto)
+# app.py — Lifeway Voice Agent (razonador + herramientas)
 # Twilio (voz) + ElevenLabs TTS + Monday (REOS) + WhatsApp + subelementos
 #
-# ENV necesarios (Render):
+# ENV necesarios:
 # OPENAI_API_KEY
 # OPENAI_MODEL (opcional, por defecto "gpt-4o-mini")
 # ELEVEN_API_KEY (o ELEVENLABS_API_KEY)
-# ELEVEN_VOICE_ID (o ELEVENLABS_VOICE_ID)
+# ELEVEN_VOICE_ID (o ELEVENLABS_VOICE_ID)   # voz de Eleven
 # TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_E164  (p.ej. "+34930348966")
 # MONDAY_API_KEY (o monday_api)
 # MONDAY_DEFAULT_BOARD_ID=2147303762   # REOS BOT LIFEWAY (padre)
@@ -81,15 +81,15 @@ BOARD_MAP: Dict[int, Dict[str, str]] = {
     },
     2068339939: {  # CESIONES REMATE (si lo activas después)
         "name": "name",
-        "direccion": "texto_mkmm1paw",    # ADRESS
+        "direccion": "texto_mkmm1paw",
         "poblacion": "texto__1",
-        "precio_main": "numeric_mkptr6ge",# PRECIO TOTAL
-        "precio_alt":  "n_meros_mkmmx03j",# PRECIO FONDO
+        "precio_main": "numeric_mkptr6ge",
+        "precio_alt":  "n_meros_mkmmx03j",
         "enlace": "enlace_mkmmpkbk",
         "imagenes": "archivo8__1",
         "catastro": "texto_mkmm8w8t",
         "fecha_visita": "date_mkq9ggyk",
-        "nolon": "texto5__1",             # REFERENCIA (ej.)
+        "nolon": "texto5__1",
         "subitems": "subitems__1",
     },
 }
@@ -102,8 +102,8 @@ log = logging.getLogger("lifeway")
 _twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN) else None
 AUDIO_STORE: Dict[str, bytes] = {}
 
-# Memoria por llamada (simple & robusto)
-SESS: Dict[str, Dict[str, Any]] = {}   # {CallSid: { "ts":..., "lang":"es", "history":[...], "step":..., "item_id":..., "cand":[] } }
+# Memoria por llamada
+SESS: Dict[str, Dict[str, Any]] = {}   # {CallSid: { "ts":..., "lang":"es", "history":[...]} }
 SESSION_TTL = 900
 
 def _sess(call_sid: str) -> Dict[str, Any]:
@@ -114,7 +114,6 @@ def _sess(call_sid: str) -> Dict[str, Any]:
     for k, v in list(SESS.items()):
         if now - (v.get("ts") or now) > SESSION_TTL:
             SESS.pop(k, None)
-    # corta historial para velocidad
     s["history"] = (s.get("history") or [])[-20:]
     return s
 
@@ -132,24 +131,19 @@ def _openai_chat(messages, temperature=0.3) -> str:
     return r.json()["choices"][0]["message"]["content"].strip()
 
 def nlu_extract(user_text: str) -> Dict[str, Any]:
-    """
-    Parser ligero y ROBUSTO: ciudad / dirección / presupuesto / sí-no / nombre / teléfono / email / idioma.
-    Pase lo que pase, devuelve un dict válido (nunca lanza JSONDecodeError).
-    """
+    """Parser ligero y ROBUSTO: devuelve dict válido pase lo que pase."""
     sys = (
         "Devuelve SOLO JSON válido con claves:"
         "{'city':str|null,'address':str|null,'budget':float|null,'yesno':'yes'|'no'|null,"
         "'name':str|null,'phone':str|null,'email':str|null,'lang':'es'|'ar'|'en'}."
         " Si no sabes, usa null."
     )
-    # fallback por defecto (incluye detección simple de árabe)
     fallback_lang = "ar" if re.search(r"[\u0600-\u06FF]", user_text or "") else "es"
     fallback = {"city":None,"address":None,"budget":None,"yesno":None,"name":None,"phone":None,"email":None,"lang":fallback_lang}
     try:
         out = _openai_chat([{"role":"system","content":sys},{"role":"user","content":user_text}], temperature=0.1)
         if not out or not out.strip():
             return fallback
-        # si el modelo respondió texto normal, NO intentamos json: devolvemos fallback
         if out.strip()[0] not in "{[":
             return fallback
         parsed = json.loads(out)
@@ -162,6 +156,176 @@ def nlu_extract(user_text: str) -> Dict[str, Any]:
     except Exception:
         log.exception("nlu_extract")
         return fallback
+
+# ===================== AGENTE RAZONADOR (FUNCTION-CALLING) =====================
+def _tool_defs():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_properties",
+                "description": "Busca inmuebles por texto libre (calle, ciudad, precio, referencia NOLON). Devuelve mejor candidato si lo hay.",
+                "parameters": {
+                    "type":"object",
+                    "properties":{
+                        "query":{"type":"string"},
+                        "board_id":{"type":"integer"}
+                    },
+                    "required":["query","board_id"]
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name":"get_property_summary",
+                "description":"Lee resumen de una propiedad (dirección, población, precio, día de visita).",
+                "parameters":{
+                    "type":"object",
+                    "properties":{"item_id":{"type":"integer"}},
+                    "required":["item_id"]
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name":"book_visit_subitem",
+                "description":"Crea subelemento (reserva) con nombre/teléfono/email. Usa fecha del padre.",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "item_id":{"type":"integer"},
+                        "name":{"type":"string"},
+                        "phone":{"type":"string"},
+                        "email":{"type":"string"}
+                    },
+                    "required":["item_id","name"]
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name":"send_whatsapp_brief",
+                "description":"Envía por WhatsApp el resumen y hasta 3 imágenes de la propiedad.",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "phone":{"type":"string"},
+                        "item_id":{"type":"integer"},
+                        "board_id":{"type":"integer"}
+                    },
+                    "required":["phone","item_id","board_id"]
+                },
+            },
+        },
+    ]
+
+def _run_tool(name:str, args:Dict[str,Any], call_sid:str, lang:str) -> Dict[str,Any]:
+    try:
+        if name == "search_properties":
+            board_id = int(args["board_id"])
+            q = str(args["query"])
+            hit = search_flexible(board_id, q)
+            if not hit:
+                return {"ok": False, "reason":"no_match"}
+            return {"ok":True, "item_id": int(hit["id"]), "name": hit.get("name")}
+
+        elif name == "get_property_summary":
+            it = monday_get_item(int(args["item_id"]))
+            if not it: return {"ok":False,"reason":"not_found"}
+            text = say_summary(it, MONDAY_DEFAULT_BOARD_ID, lang)
+            return {"ok":True,"summary":text}
+
+        elif name == "book_visit_subitem":
+            item_id = int(args["item_id"])
+            name    = (args.get("name") or "Interesado").strip()
+            phone   = (args.get("phone") or "").strip()
+            email   = (args.get("email") or "").strip()
+            it = monday_get_item(item_id)
+            if not it: return {"ok":False,"reason":"item_missing"}
+            m = BOARD_MAP.get(MONDAY_DEFAULT_BOARD_ID, BOARD_MAP[2147303762])
+            fecha_iso = _get_date(it, m["fecha_visita"])
+            nolon_txt = _get_text(it, m.get("nolon",""))
+            sid = create_subitem_contact(item_id, MONDAY_DEFAULT_BOARD_ID,
+                                         title=f"{name} - {phone or 's/tel'} - {email or 's/email'}",
+                                         name=name, phone=phone, email=email,
+                                         date_iso=fecha_iso, nolon_text=nolon_txt)
+            return {"ok": bool(sid), "subitem_id": sid}
+
+        elif name == "send_whatsapp_brief":
+            if _twilio is None: return {"ok":False,"reason":"twilio_not_configured"}
+            phone   = str(args["phone"])
+            item_id = int(args["item_id"])
+            board   = int(args["board_id"])
+            it = monday_get_item(item_id)
+            if not it: return {"ok":False,"reason":"item_missing"}
+            resumen = say_summary(it, board, "es")
+            try:
+                if phone.startswith("+"):
+                    wa_text(phone, "Ficha y visita:\n\n"+resumen)
+                    imgs = extract_images(it, board)
+                    if imgs: wa_images(phone, imgs)
+                return {"ok":True}
+            except Exception:
+                log.exception("send_whatsapp")
+                return {"ok":False,"reason":"wa_error"}
+
+        else:
+            return {"ok":False,"reason":"unknown_tool"}
+    except Exception:
+        log.exception("tool_error %s", name)
+        return {"ok":False,"reason":"exception"}
+
+def reason_and_act(history:List[Dict[str,str]], call_sid:str, lang:str, board_id:int)->str:
+    sys = (
+        f"Eres un agente de {BRAND_NAME}, cercano, rápido y útil. "
+        "Tu objetivo es ayudar con inmuebles (ubicación, precio, día de visita), "
+        "aclarar dudas sencillas y, si procede, reservar visitas y enviar la ficha por WhatsApp. "
+        "NO inventes datos de inventario: usa funciones. Si el usuario pregunta algo general, responde breve y vuelve a ofrecer ayuda con la propiedad."
+    )
+    messages = [{"role":"system","content":sys}] + history[-12:]
+    tools = _tool_defs()
+
+    while True:
+        try:
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice":"auto",
+                    "temperature":0.3
+                },
+                timeout=40
+            )
+            r.raise_for_status()
+            data = r.json()
+            choice = data["choices"][0]
+            msg = choice["message"]
+
+            if "tool_calls" in msg:
+                messages.append({"role":"assistant","tool_calls":msg["tool_calls"],"content":None})
+                for tc in msg["tool_calls"]:
+                    name = tc["function"]["name"]
+                    args = json.loads(tc["function"]["arguments"] or "{}")
+                    res = _run_tool(name, args, call_sid, lang)
+                    messages.append({
+                        "role":"tool",
+                        "tool_call_id": tc["id"],
+                        "name": name,
+                        "content": json.dumps(res, ensure_ascii=False)
+                    })
+                continue
+
+            return msg.get("content") or "¿En qué más puedo ayudarte?"
+
+        except Exception:
+            log.exception("reason_and_act")
+            return "Se me fue un cable, pero ya está. ¿Me repites lo que necesitas?"
 
 # ------------- ElevenLabs TTS -------------
 def eleven_tts_to_bytes(text: str) -> bytes:
@@ -178,7 +342,6 @@ def eleven_tts_to_bytes(text: str) -> bytes:
     return r.content
 
 def speak(vr: VoiceResponse, text: str, lang: str, base_url: str):
-    # Traducción mínima si fuese necesario (rápida)
     speak_text = text
     if lang == "en":
         try:
@@ -204,7 +367,6 @@ def speak(vr: VoiceResponse, text: str, lang: str, base_url: str):
             return
     except Exception:
         log.exception("TTS error")
-    # fallback Twilio <Say>
     vr.say(text, language="es-ES")
 
 # ------------- Monday helpers -------------
@@ -339,7 +501,6 @@ def find_by_nolon(board_id: int, nolon_digits: str) -> Optional[Dict[str, Any]]:
     return None
 
 def score_item(item, m, address, budget) -> float:
-    # Coincidencias en dirección, nombre y población; umbral más bajo
     dir_   = _get_text(item, m["direccion"])
     name_  = item.get("name","")
     pob_   = _get_text(item, m["poblacion"])
@@ -352,12 +513,10 @@ def score_item(item, m, address, budget) -> float:
         if adr in _norm(dir_):  s += 2.5
         if adr in _norm(name_): s += 1.0
         if adr in _norm(pob_):  s += 1.0
-        # tokens sueltos (calle/palabras)
         toks = [t for t in re.split(r"\s+", adr) if len(t) >= 4]
         hit = sum(1 for t in toks if t in _norm(dir_) or t in _norm(name_) or t in _norm(pob_))
         s += 0.5 * min(hit, 3)
     if budget and price:
-        # tolerancia amplia ±25%
         if abs(price - budget) <= 0.25 * budget:
             s += 1.5
     return s
@@ -370,11 +529,6 @@ def find_by_city(items, m, city) -> List[Dict[str, Any]]:
     return out
 
 def search_flexible(board_id:int, text:str)->Optional[Dict[str,Any]]:
-    """
-    1) Si detecta NOLON (con o sin puntos/espacios) intenta match directo.
-    2) Si no, puntúa por dirección/nombre/población y precio con umbral bajo.
-    Devuelve el mejor item o None.
-    """
     if not text: return None
     nolon = extract_nolon_candidate(text)
     log.info("search_flexible: nolon=%s", nolon)
@@ -458,11 +612,6 @@ def say_intro(lang: str) -> str:
     if lang=="en": return "Hi, thanks for calling Lifeway. How can I help?"
     return "Hola, gracias por llamar a Lifeway. ¿En qué puedo ayudarte?"
 
-def say_ask_details(city: Optional[str], lang: str) -> str:
-    if lang=="ar": return f"لدينا عدة خيارات في {city}. هل تتذكر الشارع أو السعر أو المرجع؟" if city else "هل تذكر الشارع أو السعر أو المرجع؟"
-    if lang=="en": return f"We have a few options in {city}. Do you remember the street, price, or reference?" if city else "Do you remember the street, price, or reference?"
-    return f"Tenemos varias opciones en {city}. ¿Recuerdas la calle, el precio o la referencia?" if city else "¿Recuerdas la calle exacta, el precio aproximado o la referencia?"
-
 def say_summary(item: Dict[str,Any], board_id:int, lang:str) -> str:
     m = BOARD_MAP.get(board_id, BOARD_MAP[MONDAY_DEFAULT_BOARD_ID])
     nombre = item.get("name") or "Propiedad"
@@ -475,21 +624,6 @@ def say_summary(item: Dict[str,Any], board_id:int, lang:str) -> str:
     if lang=="en":
         return f"{nombre}. Address: {dir_}. City: {pob}. Price: {precio}. Visit day: {fecha}."
     return f"{nombre}. Dirección: {dir_}. Población: {pob}. Precio: {precio}. Día de visita: {fecha}."
-
-def say_visit_offer(lang:str)->str:
-    if lang=="ar": return "الزيارات حسب ترتيب الوصول من 10 إلى 17. هل تريد أن أسجلك لهذا اليوم؟"
-    if lang=="en": return "Viewings are first-come, 10am–5pm. Would you like me to book you for that day?"
-    return "Las visitas son por orden de llegada de 10 a 17 h. ¿Quiere que le anote para ese día?"
-
-def say_collect_contact(lang:str)->str:
-    if lang=="ar": return "لو سمحت، اسمك ورقم هاتفك وبريدك الإلكتروني لتأكيد الحجز."
-    if lang=="en": return "Please tell me your name, phone number and email to confirm the booking."
-    return "Por favor, indíqueme su nombre, teléfono y correo electrónico para confirmar."
-
-def say_confirmed(lang:str)->str:
-    if lang=="ar": return "تم. سجلتك. هل quieres أن أرسل لك ficha والصور على واتساب؟"
-    if lang=="en": return "All set, you’re booked. Want me to send you the listing and photos on WhatsApp?"
-    return "Perfecto, queda anotado. ¿Quiere que le envíe la ficha y fotos por WhatsApp?"
 
 # ------------- Flask helpers -------------
 def ok_json(data: Any, code: int = 200):
@@ -507,7 +641,7 @@ def _new_gather():
     return Gather(
         input="speech",
         method="POST",
-        timeout=10,               # más holgado
+        timeout=10,
         action="/gather",
         actionOnEmptyResult="true",
         speechTimeout="auto",
@@ -547,156 +681,28 @@ def gather():
             speak(vr, "No te he escuchado bien. ¿Puedes repetirlo?", st.get("lang","es"), base)
             vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
 
-        log.info("CALL %s | speech='%s'", call_sid, speech)
-
-        st["history"].append({"role":"user","content":speech})
-        if len(st["history"])>20: st["history"]=st["history"][-20:]
-
-        # --- Detección de idioma rápida + NLU robusto
+        # Detección rápida de idioma y NLU (por si hace falta)
         lang = "ar" if re.search(r"[\u0600-\u06FF]", speech) else (st.get("lang") or "es")
         info = nlu_extract(speech)
         if info.get("lang"): lang = info["lang"]
         st["lang"] = lang
-        log.info("info=%s", info)
 
-        # --- 1) Intento directo por NOLON
-        nolon = extract_nolon_candidate(speech)
-        if nolon and not st.get("item_id"):
-            it = find_by_nolon(board_id, nolon)
-            if it:
-                st["item_id"] = int(it["id"])
-                speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-                st["step"] = "await_book_confirm"
-                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-            else:
-                speak(vr, "No encuentro esa referencia. ¿Me das la calle, la población o el precio aproximado?", lang, base)
-                st["step"] = None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+        # ====== AGENTE GENERAL CON HERRAMIENTAS ======
+        st["history"].append({"role":"user","content":speech})
+        st["history"] = st["history"][-20:]
 
-        # --- Máquina de estados breve ---
-        if st.get("item_id") and st.get("step") in (None, "offer_day"):
-            it = monday_get_item(st["item_id"])
-            speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-            st["step"] = "await_book_confirm"
-            vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+        # si hay contacto completo y ya se identificó la propiedad, el agente podrá llamar a book_visit_subitem;
+        # para comodidad, dejamos el teléfono detectado en historial también si viene de Twilio
+        if from_num.startswith("+") and not info.get("phone"):
+            st["history"].append({"role":"system","content":f"Teléfono que llama: {from_num}"})
 
-        if st.get("step") == "await_book_confirm":
-            if (info.get("yesno") == "no") or re.search(r"\b(no|más tarde|otro)\b", _norm(speech)):
-                speak(vr, "De acuerdo. ¿Quiere ver otra zona o necesita más detalles?", lang, base)
-                st["step"] = None; st.pop("item_id", None)
-                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-            speak(vr, say_collect_contact(lang), lang, base)
-            st["step"] = "collect_contact"
-            vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+        agent_reply = reason_and_act(st["history"], call_sid, lang, board_id)
 
-        if st.get("step") == "collect_contact":
-            name  = info.get("name")  or "Interesado"
-            phone = info.get("phone") or (from_num if from_num.startswith("+") else "")
-            email = info.get("email") or ""
-            item_id = st.get("item_id")
-            if not item_id:
-                speak(vr, "Se me ha perdido la referencia. ¿Me recuerdas la dirección o la referencia NOLON?", lang, base)
-                st["step"] = None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+        st["history"].append({"role":"assistant","content":agent_reply})
 
-            it = monday_get_item(item_id)
-            m = BOARD_MAP.get(board_id, BOARD_MAP[MONDAY_DEFAULT_BOARD_ID])
-            fecha_iso = _get_date(it, m["fecha_visita"])
-            nolon_text = _get_text(it, m.get("nolon",""))
-            create_subitem_contact(item_id, board_id,
-                                   title=f"{name} - {phone or 's/tel'} - {email or 's/email'}",
-                                   name=name, phone=phone, email=email,
-                                   date_iso=fecha_iso, nolon_text=nolon_text)
-
-            try:
-                if phone.startswith("+") and _twilio is not None:
-                    resumen = say_summary(it, board_id, "es")
-                    wa_text(phone, "Reserva anotada.\n\n" + resumen)
-                    imgs = extract_images(it, board_id)
-                    if imgs: wa_images(phone, imgs)
-            except Exception:
-                log.exception("whatsapp send")
-
-            speak(vr, say_confirmed(lang), lang, base)
-            st["step"] = None; st.pop("item_id", None)
-            vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-
-        # --- 2) Búsqueda rápida + flexible ---
-        city    = info.get("city")
-        address = info.get("address")
-        budget  = info.get("budget")
-
-        items = board_items_page(board_id, 200)
-        m = BOARD_MAP.get(board_id, BOARD_MAP[MONDAY_DEFAULT_BOARD_ID])
-
-        if city and not (address or budget):
-            cand = find_by_city(items, m, city)
-            if not cand:
-                best = search_flexible(board_id, speech)
-                if best:
-                    st["item_id"] = int(best["id"])
-                    it = monday_get_item(st["item_id"])
-                    speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-                    st["step"] = "await_book_confirm"
-                    vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-                speak(vr, f"No localizo inmuebles en {city}. ¿Probamos con la calle o la referencia?", lang, base)
-                st["step"] = None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-
-            best=None; best_sc=-1.0
-            adr = address or speech
-            for it in cand:
-                sc = score_item(it, m, adr, budget)
-                if sc > best_sc:
-                    best_sc, best = sc, it
-            if best and best_sc >= 1.0:
-                st["item_id"] = int(best["id"])
-                it = monday_get_item(st["item_id"])
-                speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-                st["step"] = "await_book_confirm"
-                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-
-            speak(vr, say_ask_details(city, lang), lang, base)
-            st["step"] = "need_detail"; st["cand"] = cand
-            vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-
-        if address or budget:
-            best = search_flexible(board_id, address or speech)
-            if best:
-                st["item_id"] = int(best["id"])
-                it = monday_get_item(st["item_id"])
-                speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-                st["step"] = "await_book_confirm"
-                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-            speak(vr, "No me queda claro cuál es. ¿Me dices la calle exacta o la referencia NOLON?", lang, base)
-            st["step"] = None; vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-
-        if st.get("step") == "need_detail":
-            cand = st.get("cand") or []
-            best=None; best_sc=-1.0
-            adr = address or speech
-            for it in cand:
-                sc = score_item(it, m, adr, budget)
-                if sc > best_sc:
-                    best_sc, best = sc, it
-            if best and best_sc >= 1.0:
-                st["item_id"] = int(best["id"])
-                it = monday_get_item(st["item_id"])
-                speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-                st["step"] = "await_book_confirm"
-                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-
-            best = search_flexible(board_id, speech)
-            if best:
-                st["item_id"] = int(best["id"])
-                it = monday_get_item(st["item_id"])
-                speak(vr, say_summary(it, board_id, lang) + " " + say_visit_offer(lang), lang, base)
-                st["step"] = "await_book_confirm"
-                vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-
-            speak(vr, "¿Tienes la calle o la referencia? Con eso lo ubico al momento.", lang, base)
-            vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
-
-        # Fallback amable
-        speak(vr, "Para ayudarte, dime la dirección, la población, el precio aproximado o la referencia NOLON.", lang, base)
-        vr.append(_new_gather()); return Response(str(vr), mimetype="application/xml")
+        speak(vr, agent_reply, lang, base)
+        vr.append(_new_gather())
+        return Response(str(vr), mimetype="application/xml")
 
     except Exception:
         log.exception("gather error")
